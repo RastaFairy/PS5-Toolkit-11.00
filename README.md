@@ -27,7 +27,7 @@
 
 <br/>
 
-> **Español** → [README.es.md](./README.es.md)
+> **Español** → [README_ES.md](./README_ES.md)
 
 </div>
 
