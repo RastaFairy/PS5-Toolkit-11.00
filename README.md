@@ -174,7 +174,7 @@ orbiskit/
 **1. Clone and configure**
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/orbiskit
+git clone https://github.com/RastaFairy/PS5-Toolkit-11.00
 cd orbiskit
 
 # Set your PC's local IP address in two places:
