@@ -175,7 +175,7 @@ orbiskit/
 **1. Clonar y configurar**
 
 ```bash
-git clone https://github.com/TU_USUARIO/orbiskit
+git clone https://github.com/RastaFairy/PS5-Toolkit-11.00
 cd orbiskit
 
 # Editar la IP del PC en dos lugares:
