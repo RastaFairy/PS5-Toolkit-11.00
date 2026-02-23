@@ -26,7 +26,7 @@ Gracias por tu interés en contribuir. Este documento explica cómo hacerlo de f
 ```bash
 # 1. Fork del repositorio en GitHub
 # 2. Clonar tu fork
-git clone https://github.com/TU_USUARIO/ps5-toolkit-11xx
+git clone https://github.com/RastaFairy/PS5-Toolkit-11.00
 cd ps5-toolkit-11xx
 
 # 3. Crear una rama para tu contribución
