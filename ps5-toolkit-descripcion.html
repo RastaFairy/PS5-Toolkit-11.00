@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PS5 Toolkit 11.xx — Descripción del Proyecto</title>
+<title>PS5 Toolkit 11.00 — OrbisKit · github.com/RastaFairy</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&family=IBM+Plex+Mono:wght@300;400;600&display=swap');
 
@@ -734,9 +734,9 @@
 ══════════════════════════════════════════════════════ -->
 <div class="hero">
   <div class="hero-grid"></div>
-  <div class="hero-tag">Documentación técnica</div>
-  <h1>PS5 Toolkit<br><span>11.xx</span></h1>
-  <p class="hero-sub">Framework modular de ejecución de código arbitrario e inyección de payloads para PlayStation 5 firmware 11.00. Punto de entrada vía WebKit, persistencia en SceRedisServer.</p>
+  <div class="hero-tag">Documentación técnica &nbsp;·&nbsp; <a href="https://github.com/RastaFairy/PS5-Toolkit-11.00" target="_blank" style="color:var(--ps-cyan);text-decoration:none;letter-spacing:1px;">github.com/RastaFairy/PS5-Toolkit-11.00</a></div>
+  <h1>OrbisKit<br><span>PS5 FW 11.00</span></h1>
+  <p class="hero-sub">Framework modular de ejecución de código arbitrario e inyección de payloads para PlayStation 5 firmware 11.00. Punto de entrada vía WebKit, persistencia en SceRedisServer. Estado: infraestructura completa — pendiente análisis binario del WebKit 11.00.</p>
   <div class="hero-badges">
     <span class="badge badge-fw">FW 11.00</span>
     <span class="badge badge-arch">FreeBSD · AMD64 · Zen 2</span>
@@ -1080,7 +1080,7 @@
   <h2 class="section-title">Árbol de archivos</h2>
 
   <div class="file-tree">
-<div>ps5-toolkit-11xx/</div>
+<div>PS5-Toolkit-11.00/  <span class="comment"># github.com/RastaFairy/PS5-Toolkit-11.00</span></div>
 <div class="indent1">├── <span class="dir">exploit/</span>                  <span class="comment">← Se sirve al browser de la PS5</span></div>
 <div class="indent2">├── <span class="file important">index.html</span>            <span class="comment">← Orquestador (UI + lanzador del exploit)</span></div>
 <div class="indent2">└── <span class="dir">js/</span></div>
@@ -1129,7 +1129,7 @@
         <div>
           <h4>1. Clonar y configurar</h4>
           <p>Clonar el repositorio y editar <code>exploit/js/loader.js</code> cambiando <code>HOST_IP</code> por la IP del PC en la red local. También editar <code>payload/example/hello.c</code> con la misma IP.</p>
-          <div class="code-block"><span class="prompt">$</span> <span class="cmd">git clone</span> <span class="arg">https://github.com/RastaFairy/PS5-Toolkit-11.00</span>
+          <div class="code-block"><span class="prompt">$</span> <span class="cmd">git clone</span> <span class="arg">https://github.com/RastaFairy/PS5-Toolkit-11.00</span>  <span class="cmt"># OrbisKit</span>
 <span class="prompt">$</span> <span class="cmd">nano</span> exploit/js/loader.js  <span class="cmt"># HOST_IP = "192.168.1.X"</span></div>
         </div>
       </div>
@@ -1270,8 +1270,8 @@ NO actualizar      (perderías el exploit)</div>
   <div class="callout callout-critical" style="margin-top:24px;">
     <div class="callout-icon">⚠️</div>
     <div>
-      <strong>Trabajo pendiente crítico:</strong>
-      <p style="margin-top:6px;">Las funciones <code>triggerWebKitBug()</code> y <code>leakLibKernelBase()</code> en <code>index.html</code> son las únicas piezas que requieren análisis del binario WebKit de FW 11.00. El resto del scaffold está completamente implementado y las espera. Ver <strong>docs/offsets_guide.md</strong> para el proceso con Ghidra.</p>
+      <strong>Solo quedan dos cosas que requieren los binarios:</strong>
+      <p style="margin-top:6px;">1. Verificar offsets marcados con <code>⚠ VERIFICAR</code> — ejecutar <code>gen_offsets.py</code> con los <code>.elf</code>.<br>2. Offset <code>prison0</code> en <code>kernel.js</code> — extraído automáticamente por <code>analyze_kernel.py</code>.<br><br>Todo lo demás está implementado y conectado. Un solo comando genera el <code>offsets_1100.js</code> definitivo. Ver <strong>docs/offsets_guide.md</strong>.</p>
     </div>
   </div>
 
@@ -1279,7 +1279,7 @@ NO actualizar      (perderías el exploit)</div>
     <div class="callout-icon">🔎</div>
     <div>
       <strong>Offsets en offsets_1100.js:</strong>
-      <p style="margin-top:6px;">Los offsets incluidos son aproximaciones basadas en builds anteriores. Deben verificarse contra el dump real del FW 11.00 con Ghidra antes de ejecutar el exploit completo.</p>
+      <p style="margin-top:6px;">Los offsets están documentados y nombrados en <code>offsets_1100.js</code>. Los marcados con <code>⚠ VERIFICAR</code> se generan automáticamente con <code>gen_offsets.py</code> en cuanto tengas los <code>.elf</code> del FW 11.00. El offset <code>prison0</code> se extrae con <code>analyze_kernel.py</code>.</p>
     </div>
   </div>
 </div>
@@ -1326,11 +1326,11 @@ NO actualizar      (perderías el exploit)</div>
     </li>
     <li class="todo-pending">
       <div class="todo-check">✗</div>
-      <div class="todo-text"><strong>triggerWebKitBug()</strong> — La función que dispara el bug específico del FW 11.00. Requiere análisis del binario WebKit con el OSS mirror de Sony + Ghidra. Es el único eslabón faltante para tener el exploit end-to-end.</div>
+      <div class="todo-text"><strong>triggerWebKitBug()</strong> — Único eslabón faltante para el exploit end-to-end. Requiere análisis del binario WebKit del FW 11.00 con Ghidra + OSS mirror de Sony. Una vez identificado, el resto de la cadena está listo para recibirlo.</div>
     </li>
     <li class="todo-pending">
       <div class="todo-check">✗</div>
-      <div class="todo-text"><strong>leakLibKernelBase()</strong> — El leak de la base de libkernel desde el proceso WebKit. Depende de conocer un offset en la GOT de WebKit que apunte a libkernel, lo que requiere análisis del binario.</div>
+      <div class="todo-text"><strong>leakLibKernelBase()</strong> — Requiere un puntero conocido en la GOT de WebKit que apunte a libkernel. Se extrae automáticamente con <code>gen_offsets.py</code> una vez disponibles los <code>.elf</code> del FW 11.00.</div>
     </li>
   </ul>
 </div>
@@ -1339,8 +1339,8 @@ NO actualizar      (perderías el exploit)</div>
      FOOTER
 ══════════════════════════════════════════════════════ -->
 <div class="footer">
-  <p>PS5 Toolkit 11.xx · Solo para fines educativos y de investigación de seguridad</p>
-  <p style="margin-top:8px; opacity:0.5;">Usa en hardware propio · GPLv3 · Créditos: ChendoChap, john-tornblom, SpecterDev, idlesauce, sleirsgoevy, abc</p>
+  <p>OrbisKit · PS5 Toolkit 11.00 · Solo para fines educativos y de investigación de seguridad</p>
+  <p style="margin-top:8px; opacity:0.5;">Usa en hardware propio · GPLv3 · <a href="https://github.com/RastaFairy/PS5-Toolkit-11.00" style="color:var(--text-dim);text-decoration:none;" target="_blank">github.com/RastaFairy/PS5-Toolkit-11.00</a></p><p style="margin-top:6px; opacity:0.4;">Créditos: ChendoChap, john-tornblom, SpecterDev, idlesauce, sleirsgoevy, abc</p>
 </div>
 
 </body>
