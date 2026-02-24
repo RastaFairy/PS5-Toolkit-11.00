@@ -1,290 +1,330 @@
 /**
- * elfldr.c — Parser y ejecutor de payloads ELF / SELF / RAW para PS5
+ * elfldr.c — ELF64 / SELF / RAW Payload Parser and Loader
  *
- * Soporta:
- *   • ELF64 estático (sin dynamic linker) — el caso más común para payloads
- *   • ELF64 PIC/PIE — con relocation básica
- *   • SELF (.self / .sprx) — extrae el ELF embebido y lo procesa igual
- *   • RAW — se copia a memoria RWX y se ejecuta desde el inicio del buffer
+ * Architecture: FreeBSD AMD64 (Orbis OS)
  *
- * Restricciones del entorno PS5:
- *   • XOM: las páginas ejecutables NO son legibles. Por eso el ELF se carga
- *     primero como RW, se parchean las relocations, y LUEGO se marcan RX.
- *   • ASLR: la base de carga se elige con mmap() y puede ser aleatoria.
- *     Los payloads PIE deben manejar self-relocation.
- *   • No hay dynamic linker disponible en este contexto. Los payloads
- *     deben ser estáticos o resolver sus propias importaciones.
+ * ELF64 loading sequence:
+ *   1. Validate ELF header (magic, class, machine)
+ *   2. Iterate PT_LOAD program headers
+ *   3. mmap each segment at its p_vaddr with correct PROT flags
+ *   4. Copy segment bytes from file
+ *   5. Apply RELA relocations (if present)
+ *   6. Jump to e_entry
+ *
+ * SELF loading:
+ *   Extract the inner ELF from the SELF container, then follow ELF64 path.
+ *
+ * RAW loading:
+ *   mmap at RAW_BASE_ADDR, mark PROT_READ|EXEC, call.
  */
 
+#include <sys/types.h>
+#include <sys/mman.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <elf.h>
 
 #include "elfldr.h"
 
-/* ── Constantes y macros ───────────────────────────────────────────────── */
+/* ─── ELF64 type definitions ─────────────────────────────────────────────── */
 
-#define ELF_MAGIC      0x464C457FU  /* \x7fELF en little-endian */
-#define SELF_MAGIC     0x464F5300U  /* \x00PSF en big-endian = PSF\x00 */
+typedef uint64_t Elf64_Addr;
+typedef uint64_t Elf64_Off;
+typedef uint32_t Elf64_Word;
+typedef uint64_t Elf64_Xword;
+typedef int64_t  Elf64_Sxword;
+typedef uint16_t Elf64_Half;
 
-#define ALIGN_UP(v, a)   (((v) + (a) - 1) & ~((a) - 1))
-#define ALIGN_DOWN(v, a) ((v) & ~((a) - 1))
-#define PAGE_SIZE        0x4000     /* 16 KiB — tamaño de página en Orbis */
+#define EI_NIDENT  16
 
-/* Tamaño máximo de un segmento individual (256 MiB) */
-#define MAX_SEGMENT_SIZE (256UL * 1024 * 1024)
+typedef struct {
+    uint8_t    e_ident[EI_NIDENT];
+    Elf64_Half e_type;
+    Elf64_Half e_machine;
+    Elf64_Word e_version;
+    Elf64_Addr e_entry;
+    Elf64_Off  e_phoff;
+    Elf64_Off  e_shoff;
+    Elf64_Word e_flags;
+    Elf64_Half e_ehsize;
+    Elf64_Half e_phentsize;
+    Elf64_Half e_phnum;
+    Elf64_Half e_shentsize;
+    Elf64_Half e_shnum;
+    Elf64_Half e_shstrndx;
+} Elf64_Ehdr;
 
-/* ── Estructura SELF (simplificada) ────────────────────────────────────── */
-/* El formato SELF de Sony envuelve un ELF firmado. La cabecera describe
- * segmentos cifrados; el ELF real está embebido. Esta es la vista mínima
- * que necesitamos para extraer el ELF interno. */
+typedef struct {
+    Elf64_Word  p_type;
+    Elf64_Word  p_flags;
+    Elf64_Off   p_offset;
+    Elf64_Addr  p_vaddr;
+    Elf64_Addr  p_paddr;
+    Elf64_Xword p_filesz;
+    Elf64_Xword p_memsz;
+    Elf64_Xword p_align;
+} Elf64_Phdr;
 
-typedef struct __attribute__((packed)) {
-    uint32_t magic;         /* 0x4F465350 "OPFS" o 0x00534600 */
-    uint8_t  version;
-    uint8_t  mode;
-    uint8_t  endian;
-    uint8_t  attributes;
-    uint16_t category;
-    uint16_t program_type;
-    uint64_t padding1;
-    uint16_t header_size;
-    uint16_t sign_info_size;
-    uint32_t file_size;
-    uint32_t padding2;
-    uint16_t num_entries;
-    uint16_t flags;
-} SelfHeader;
+typedef struct {
+    Elf64_Addr   r_offset;
+    Elf64_Xword  r_info;
+    Elf64_Sxword r_addend;
+} Elf64_Rela;
 
-/* ── Implementación ────────────────────────────────────────────────────── */
+typedef struct {
+    Elf64_Addr   st_value;
+    /* ... other fields not needed for basic relocation */
+} Elf64_Sym;
+
+/* Program header types */
+#define PT_LOAD    1
+#define PT_DYNAMIC 2
+
+/* Program header flags */
+#define PF_X  1
+#define PF_W  2
+#define PF_R  4
+
+/* Relocation type */
+#define R_X86_64_RELATIVE  8
+
+/* ─── Format detection ───────────────────────────────────────────────────── */
+
+elfldr_fmt_t elfldr_detect_format(const uint8_t *data, size_t len) {
+    if (len < 4) return ELFLDR_FMT_RAW;
+
+    /* ELF magic: \x7fELF */
+    if (data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F') {
+        return ELFLDR_FMT_ELF64;
+    }
+
+    /* SELF magic variant 1: \x00PSF */
+    if (data[0] == 0x00 && data[1] == 'P' && data[2] == 'S' && data[3] == 'F') {
+        return ELFLDR_FMT_SELF;
+    }
+
+    /* SELF magic variant 2 */
+    if (data[0] == 0x4f && data[1] == 0x15 && data[2] == 0x3d && data[3] == 0x1d) {
+        return ELFLDR_FMT_SELF;
+    }
+
+    return ELFLDR_FMT_RAW;
+}
+
+/* ─── Helpers ─────────────────────────────────────────────────────────────── */
+
+/** Convert ELF segment flags to mmap PROT_* flags. */
+static int phdr_prot(Elf64_Word p_flags) {
+    int prot = 0;
+    if (p_flags & PF_R) prot |= PROT_READ;
+    if (p_flags & PF_W) prot |= PROT_WRITE;
+    if (p_flags & PF_X) prot |= PROT_EXEC;
+    return prot;
+}
+
+/** Round `n` down to the nearest multiple of `align`. */
+static Elf64_Addr align_down(Elf64_Addr n, Elf64_Xword align) {
+    return (align > 1) ? (n & ~(align - 1)) : n;
+}
+
+/** Round `n` up to the nearest multiple of `align`. */
+static Elf64_Addr align_up(Elf64_Addr n, Elf64_Xword align) {
+    return (align > 1) ? ((n + align - 1) & ~(align - 1)) : n;
+}
+
+/* ─── ELF64 loader ───────────────────────────────────────────────────────── */
 
 /**
- * Detecta el tipo de un payload por sus magic bytes.
+ * Validate the ELF header.
+ * @returns 0 on success, non-zero on invalid header.
  */
-PayloadType elfldr_detect_type(const uint8_t *buf, size_t len) {
-    if (len < 4) return PAYLOAD_RAW;
-
-    uint32_t magic;
-    memcpy(&magic, buf, 4);
-
-    if (magic == ELF_MAGIC) return PAYLOAD_ELF;
-
-    /* SELF: los primeros bytes son 0x00 P S F (big-endian: 0x00505346) */
-    if (buf[0] == 0x00 && buf[1] == 'P' && buf[2] == 'S' && buf[3] == 'F')
-        return PAYLOAD_SELF;
-
-    return PAYLOAD_RAW;
+static int elf64_validate(const Elf64_Ehdr *ehdr, size_t len) {
+    if (len < sizeof(Elf64_Ehdr))            return -1;
+    if (ehdr->e_ident[0] != 0x7f)           return -2;
+    if (ehdr->e_ident[1] != 'E')            return -2;
+    if (ehdr->e_ident[2] != 'L')            return -2;
+    if (ehdr->e_ident[3] != 'F')            return -2;
+    if (ehdr->e_ident[4] != 2)              return -3;  /* ELFCLASS64 */
+    if (ehdr->e_ident[5] != 1)              return -4;  /* ELFDATA2LSB */
+    if (ehdr->e_machine   != 62)            return -5;  /* EM_X86_64 */
+    return 0;
 }
 
 /**
- * Extrae el ELF embebido en un SELF.
- * Retorna un puntero al inicio del ELF y su tamaño, o NULL en error.
+ * Load and execute an ELF64 binary.
  *
- * Nota: el puntero retornado apunta dentro de 'buf'; NO hay copia.
- * El caller debe verificar que el ELF resultante es válido.
+ * @param data   Raw ELF bytes.
+ * @param len    Length of data.
+ * @param base   Load offset (0 for non-PIE, computed for PIE).
+ * @returns      Non-zero on error. Does not return on success.
  */
-static const uint8_t *self_extract_elf(const uint8_t *buf, size_t len,
-                                        size_t *elf_len_out) {
-    if (len < sizeof(SelfHeader)) return NULL;
+static int elf64_load(const uint8_t *data, size_t len) {
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)data;
 
-    const SelfHeader *hdr = (const SelfHeader *)buf;
-    uint16_t hdr_size     = hdr->header_size;
+    if (elf64_validate(ehdr, len) != 0) return -1;
 
-    if (hdr_size >= len) return NULL;
+    /* Determine if PIE (ET_DYN) and find load bias */
+    Elf64_Addr load_bias = 0;
+    int is_pie = (ehdr->e_type == 3); /* ET_DYN */
 
-    /* El ELF empieza justo después de la cabecera SELF */
-    const uint8_t *elf = buf + hdr_size;
-    size_t         rem = len - hdr_size;
+    /* First pass: if PIE, allocate space and compute bias */
+    if (is_pie) {
+        /* Find the lowest and highest vaddrs to determine total size */
+        Elf64_Addr min_vaddr = (Elf64_Addr)-1;
+        Elf64_Addr max_vaddr = 0;
 
-    /* Verificar que tenga el magic ELF */
-    uint32_t magic;
-    if (rem < 4) return NULL;
-    memcpy(&magic, elf, 4);
-    if (magic != ELF_MAGIC) return NULL;
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            const Elf64_Phdr *phdr =
+                (const Elf64_Phdr *)(data + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (phdr->p_type != PT_LOAD) continue;
 
-    *elf_len_out = rem;
-    return elf;
-}
-
-/**
- * Carga un ELF64 en memoria y retorna un puntero a la función de entrada.
- *
- * @param buf      Buffer con el ELF completo
- * @param len      Longitud del buffer
- * @param base_out Se rellena con la dirección base de carga (para PIE)
- * @returns        Puntero a la función de entrada, o NULL en error
- */
-static void *elf_load(const uint8_t *buf, size_t len, uintptr_t *base_out) {
-    if (len < sizeof(Elf64_Ehdr)) return NULL;
-
-    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)buf;
-
-    /* Validaciones básicas */
-    if (ehdr->e_ident[EI_CLASS]   != ELFCLASS64)   return NULL;
-    if (ehdr->e_ident[EI_DATA]    != ELFDATA2LSB)   return NULL;
-    if (ehdr->e_machine           != EM_X86_64)     return NULL;
-    if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN) return NULL;
-
-    /* ── Calcular el rango de carga ── */
-    uintptr_t vaddr_min = UINTPTR_MAX;
-    uintptr_t vaddr_max = 0;
-
-    const Elf64_Phdr *phdr = (const Elf64_Phdr *)(buf + ehdr->e_phoff);
-
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdr[i].p_type != PT_LOAD) continue;
-        if (phdr[i].p_memsz == 0)      continue;
-
-        uintptr_t seg_start = ALIGN_DOWN(phdr[i].p_vaddr, PAGE_SIZE);
-        uintptr_t seg_end   = ALIGN_UP(phdr[i].p_vaddr + phdr[i].p_memsz, PAGE_SIZE);
-
-        if (seg_start < vaddr_min) vaddr_min = seg_start;
-        if (seg_end   > vaddr_max) vaddr_max = seg_end;
-    }
-
-    if (vaddr_min == UINTPTR_MAX || vaddr_max == 0) return NULL;
-
-    size_t total_size = vaddr_max - vaddr_min;
-    if (total_size == 0 || total_size > MAX_SEGMENT_SIZE) return NULL;
-
-    /* ── Reservar espacio de carga ── */
-    /* Para ELF estático (ET_EXEC) intentamos cargar en la dirección exacta.
-     * Para PIE (ET_DYN) dejamos que el kernel elija la base. */
-    void *hint = (ehdr->e_type == ET_EXEC) ? (void *)vaddr_min : NULL;
-
-    void *load_base = mmap(hint, total_size,
-                           PROT_READ | PROT_WRITE,
-                           MAP_ANONYMOUS | MAP_PRIVATE,
-                           -1, 0);
-    if (load_base == MAP_FAILED) return NULL;
-
-    /* Para ET_EXEC verificar que el SO mapeó donde pedimos */
-    if (ehdr->e_type == ET_EXEC && (uintptr_t)load_base != vaddr_min) {
-        munmap(load_base, total_size);
-        return NULL;
-    }
-
-    uintptr_t slide = (uintptr_t)load_base - vaddr_min;
-    if (base_out) *base_out = (uintptr_t)load_base;
-
-    /* Inicializar todo a cero (para BSS implícito) */
-    memset(load_base, 0, total_size);
-
-    /* ── Cargar segmentos PT_LOAD ── */
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        const Elf64_Phdr *ph = &phdr[i];
-        if (ph->p_type != PT_LOAD) continue;
-        if (ph->p_memsz == 0)      continue;
-
-        if (ph->p_filesz > len - ph->p_offset) {
-            /* El ELF está truncado */
-            munmap(load_base, total_size);
-            return NULL;
+            if (phdr->p_vaddr < min_vaddr) min_vaddr = phdr->p_vaddr;
+            Elf64_Addr end = phdr->p_vaddr + phdr->p_memsz;
+            if (end > max_vaddr) max_vaddr = end;
         }
 
-        uintptr_t dest = (uintptr_t)load_base + (ph->p_vaddr - vaddr_min);
-        memcpy((void *)dest, buf + ph->p_offset, ph->p_filesz);
-        /* El resto (p_memsz - p_filesz) ya es cero por el memset anterior */
+        size_t total = (size_t)(max_vaddr - min_vaddr);
+        void *base = mmap(NULL, total,
+                          PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS,
+                          -1, 0);
+        if (base == MAP_FAILED) return -2;
+        load_bias = (Elf64_Addr)base - min_vaddr;
     }
 
-    /* ── Aplicar relocations (solo para PIE con RELA) ── */
-    /* Buscamos la sección .rela.dyn si existe */
-    if (ehdr->e_type == ET_DYN && ehdr->e_shoff != 0) {
-        const Elf64_Shdr *shdr = (const Elf64_Shdr *)(buf + ehdr->e_shoff);
-        for (int i = 0; i < ehdr->e_shnum; i++) {
-            if (shdr[i].sh_type != SHT_RELA) continue;
+    /* Second pass: map each PT_LOAD segment */
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        const Elf64_Phdr *phdr =
+            (const Elf64_Phdr *)(data + ehdr->e_phoff + i * ehdr->e_phentsize);
 
-            const Elf64_Rela *rela = (const Elf64_Rela *)(buf + shdr[i].sh_offset);
-            size_t nrela = shdr[i].sh_size / sizeof(Elf64_Rela);
+        if (phdr->p_type != PT_LOAD) continue;
+        if (phdr->p_memsz == 0)      continue;
 
-            for (size_t j = 0; j < nrela; j++) {
-                uint32_t rtype = ELF64_R_TYPE(rela[j].r_info);
-                uintptr_t *target = (uintptr_t *)((uintptr_t)load_base
-                                                  + rela[j].r_offset
-                                                  - vaddr_min);
+        Elf64_Addr seg_start = align_down(phdr->p_vaddr + load_bias, phdr->p_align);
+        Elf64_Addr seg_end   = align_up(phdr->p_vaddr + load_bias + phdr->p_memsz, phdr->p_align);
+        size_t     seg_size  = (size_t)(seg_end - seg_start);
 
-                switch (rtype) {
-                case R_X86_64_RELATIVE:
-                    /* B + A */
-                    *target = (uintptr_t)load_base + rela[j].r_addend;
-                    break;
-                case R_X86_64_64:
-                    /* S + A — requiere tabla de símbolos; ignorar por ahora */
-                    break;
-                default:
-                    break;
+        /* Map the segment as RW first so we can write it */
+        void *seg = mmap((void *)seg_start, seg_size,
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                         -1, 0);
+        if (seg == MAP_FAILED) return -3;
+
+        /* Copy data from file into segment */
+        if (phdr->p_filesz > 0 && phdr->p_offset + phdr->p_filesz <= len) {
+            memcpy((uint8_t *)seg + (phdr->p_vaddr - align_down(phdr->p_vaddr, phdr->p_align)),
+                   data + phdr->p_offset,
+                   phdr->p_filesz);
+        }
+
+        /* Apply final protection flags */
+        mprotect(seg, seg_size, phdr_prot(phdr->p_flags));
+    }
+
+    /* Apply RELA relocations if PIE */
+    if (is_pie && load_bias != 0) {
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            const Elf64_Phdr *phdr =
+                (const Elf64_Phdr *)(data + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (phdr->p_type != PT_DYNAMIC) continue;
+
+            /* Walk dynamic entries to find RELA table */
+            /* (simplified: only handles R_X86_64_RELATIVE) */
+            const int64_t *dyn = (const int64_t *)(data + phdr->p_offset);
+            const Elf64_Rela *rela = NULL;
+            size_t rela_count = 0;
+
+            for (; dyn[0] != 0; dyn += 2) {
+                if (dyn[0] == 7  /* DT_RELA */)      rela       = (const Elf64_Rela *)(load_bias + dyn[1]);
+                if (dyn[0] == 8  /* DT_RELASZ */)     rela_count = dyn[1] / sizeof(Elf64_Rela);
+            }
+
+            if (rela && rela_count) {
+                for (size_t r = 0; r < rela_count; r++) {
+                    uint32_t rtype = (uint32_t)(rela[r].r_info & 0xffffffff);
+                    if (rtype == R_X86_64_RELATIVE) {
+                        uint64_t *target = (uint64_t *)(load_bias + rela[r].r_offset);
+                        *target = load_bias + rela[r].r_addend;
+                    }
                 }
             }
+            break;
         }
     }
 
-    /* ── Aplicar permisos de página por segmento ── */
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        const Elf64_Phdr *ph = &phdr[i];
-        if (ph->p_type != PT_LOAD) continue;
-        if (ph->p_memsz == 0)      continue;
+    /* Jump to entry point */
+    Elf64_Addr entry = ehdr->e_entry + load_bias;
+    typedef void (*entry_fn_t)(void);
+    ((entry_fn_t)entry)();
 
-        int prot = 0;
-        if (ph->p_flags & PF_R) prot |= PROT_READ;
-        if (ph->p_flags & PF_W) prot |= PROT_WRITE;
-        if (ph->p_flags & PF_X) prot |= PROT_EXEC;
-
-        uintptr_t seg_start = ALIGN_DOWN((uintptr_t)load_base
-                                         + ph->p_vaddr - vaddr_min, PAGE_SIZE);
-        size_t seg_size     = ALIGN_UP(ph->p_memsz + (ph->p_vaddr & (PAGE_SIZE-1)),
-                                       PAGE_SIZE);
-
-        mprotect((void *)seg_start, seg_size, prot);
-    }
-
-    /* Dirección de entrada */
-    uintptr_t entry = ehdr->e_entry + slide;
-    return (void *)entry;
+    /* Should not reach here */
+    return 0;
 }
 
-/**
- * Ejecuta un payload (ELF, SELF o RAW).
+/* ─── SELF extractor ─────────────────────────────────────────────────────── */
+
+/*
+ * SELF (Signed ELF) is Sony's wrapping format. The inner ELF starts at a
+ * known offset within the container. The exact offset varies by SELF version;
+ * the most common layout has the inner ELF starting at byte 0x100 or at an
+ * offset stored in the SELF header.
  *
- * @param buf   Buffer con el payload
- * @param len   Tamaño del payload
- * @param type  Tipo detectado (ver PayloadType)
- * @returns     0 si OK, código de error si falla
+ * SELF header (simplified, first 32 bytes):
+ *   +0x00  uint32  magic         (0x00505346 or 0x4f153d1d)
+ *   +0x04  uint32  unk
+ *   +0x08  uint16  category
+ *   +0x0a  uint16  program_type
+ *   +0x0c  uint16  padding
+ *   +0x0e  uint16  header_size   ← inner ELF starts here
+ *   +0x10  uint64  elf_file_size
  */
-int elfldr_exec(uint8_t *buf, size_t len, PayloadType type) {
-    void *entry = NULL;
 
-    if (type == PAYLOAD_SELF) {
-        /* Extraer ELF del SELF */
-        size_t elf_len = 0;
-        const uint8_t *elf = self_extract_elf(buf, len, &elf_len);
-        if (!elf) return ELFLDR_ERR_SELF_EXTRACT;
+#define SELF_HEADER_SIZE_OFFSET  0x0e
 
-        uintptr_t base;
-        entry = elf_load(elf, elf_len, &base);
+static int self_load(const uint8_t *data, size_t len) {
+    if (len < 0x20) return -1;
 
-    } else if (type == PAYLOAD_ELF) {
-        uintptr_t base;
-        entry = elf_load(buf, len, &base);
+    /* Read the offset of the inner ELF from the SELF header */
+    uint16_t inner_offset;
+    memcpy(&inner_offset, data + SELF_HEADER_SIZE_OFFSET, sizeof(inner_offset));
 
-    } else {
-        /* RAW: copiar a memoria RWX y saltar al inicio */
-        void *mem = mmap(NULL, len,
-                         PROT_READ | PROT_WRITE | PROT_EXEC,
-                         MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-        if (mem == MAP_FAILED) return ELFLDR_ERR_MMAP;
+    if (inner_offset >= len) return -2;
 
-        memcpy(mem, buf, len);
-        entry = mem;
+    const uint8_t *inner = data + inner_offset;
+    size_t inner_len = len - inner_offset;
+
+    /* Validate that the inner data looks like an ELF */
+    if (elfldr_detect_format(inner, inner_len) != ELFLDR_FMT_ELF64) return -3;
+
+    return elf64_load(inner, inner_len);
+}
+
+/* ─── RAW loader ─────────────────────────────────────────────────────────── */
+
+static int raw_load(const uint8_t *data, size_t len) {
+    void *base = mmap((void *)RAW_BASE_ADDR, len,
+                      PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                      -1, 0);
+    if (base == MAP_FAILED) return -1;
+
+    memcpy(base, data, len);
+    mprotect(base, len, PROT_READ | PROT_EXEC);
+
+    typedef void (*raw_fn_t)(void);
+    ((raw_fn_t)base)();
+
+    return 0;
+}
+
+/* ─── Public API ─────────────────────────────────────────────────────────── */
+
+int elfldr_exec(const uint8_t *data, size_t len, elfldr_fmt_t fmt) {
+    switch (fmt) {
+        case ELFLDR_FMT_ELF64: return elf64_load(data, len);
+        case ELFLDR_FMT_SELF:  return self_load(data, len);
+        case ELFLDR_FMT_RAW:   return raw_load(data, len);
+        default:               return -99;
     }
-
-    if (!entry) return ELFLDR_ERR_LOAD;
-
-    /* Llamar al punto de entrada como una función C sin argumentos */
-    typedef int (*EntryFn)(void);
-    EntryFn fn = (EntryFn)entry;
-    return fn();
 }

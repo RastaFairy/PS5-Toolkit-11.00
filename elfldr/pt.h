@@ -1,19 +1,28 @@
 /**
- * pt.h — API del módulo de bootstrap vía ptrace
+ * pt.h — ptrace Bootstrap Interface
  */
 
 #ifndef PT_H
 #define PT_H
 
-#include <sys/types.h>
+#include <stdint.h>
+
+/* ─── Return codes ───────────────────────────────────────────────────────── */
+
+#define PT_OK                  0
+#define PT_ERR_PROC_NOT_FOUND -1
+#define PT_ERR_ATTACH_FAILED  -2
+#define PT_ERR_GETREGS_FAILED -3
+#define PT_ERR_WRITE_FAILED   -4
+
+/* ─── API ────────────────────────────────────────────────────────────────── */
 
 /**
- * Inyecta el ELF loader en el proceso indicado por su nombre,
- * usando ptrace para escribir y ejecutar código en ese proceso.
+ * Attach to SceRedisServer via ptrace and inject the persistent ELF loader.
  *
- * @param target_name  Nombre del proceso (ej. "SceRedisServer")
- * @returns 0 si OK, -1 si error
+ * @param elfldr_main_addr  Address of elfldr_main() to call in the target.
+ * @returns PT_OK on success, negative error code on failure.
  */
-int pt_bootstrap(const char *target_name);
+int pt_inject(uintptr_t elfldr_main_addr);
 
 #endif /* PT_H */

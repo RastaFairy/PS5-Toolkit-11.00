@@ -1,318 +1,248 @@
 /**
- * main.c — ELF Loader para PS5 FW 11.xx
+ * main.c — Persistent ELF Loader TCP Listener
  *
- * Este loader se inyecta en SceRedisServer via ptrace para persistir
- * incluso durante el rest mode y los cambios de juego.
+ * This program is injected into SceRedisServer via ptrace (see pt.c).
+ * It runs as a persistent TCP listener on port 9021, accepts ELF/BIN/SELF
+ * files from the host PC, and executes them in a forked child process.
  *
- * Una vez activo, escucha en el puerto 9021 (TCP) y acepta payloads
- * en formato ELF, RAW binario, o SELF.
- *
- * Compilar con ps5-payload-sdk:
+ * Build with ps5-payload-sdk:
  *   export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
- *   make
+ *   make -C elfldr/
  *
- * Arquitectura basada en:
- *   - john-tornblom/ps5-payload-elfldr (técnica ptrace + SceRedisServer)
- *   - ps5-payload-dev/elfldr (versión actualizada)
+ * Architecture: FreeBSD AMD64 (Orbis OS)
+ * Compile target: PS5 payload ELF (position-independent, no standard libc)
  */
 
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 #include <stdint.h>
-#include <stddef.h>
 #include <string.h>
 #include <errno.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/ptrace.h>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <signal.h>
 
 #include "elfldr.h"
-#include "pt.h"
 
-/* ── Configuración ─────────────────────────────────────────────────────── */
+/* ─── Configuration ──────────────────────────────────────────────────────── */
 
 #define LISTEN_PORT      9021
 #define LISTEN_BACKLOG   4
-#define MAX_PAYLOAD_SIZE (64 * 1024 * 1024)   /* 64 MiB máximo por payload  */
-#define LOG_UDP_PORT     9998                  /* Receptor de logs en el PC   */
+#define RECV_BUF_SIZE    (8 * 1024 * 1024)   /* 8 MB max payload */
+#define LOG_UDP_PORT     9998
 
-/* Nombre del proceso destino para el bootstrap vía ptrace */
-#define TARGET_PROCESS   "SceRedisServer"
+/* ─── UDP log helper ─────────────────────────────────────────────────────── */
 
-/* ── Tipos internos ────────────────────────────────────────────────────── */
+static int g_log_sock = -1;
+static struct sockaddr_in g_log_addr;
 
-typedef struct {
-    int   fd;             /* Socket del cliente conectado */
-    pid_t child_pid;      /* PID del proceso hijo que ejecuta el payload */
-} PayloadSession;
+/**
+ * Initialise the UDP log socket.
+ * Log messages are broadcast to 255.255.255.255:9998 and received by
+ * tools/listen_log.py on the host PC.
+ */
+static void log_init(void) {
+    g_log_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_log_sock < 0) return;
 
-/* ── Prototipos ────────────────────────────────────────────────────────── */
+    int broadcast = 1;
+    setsockopt(g_log_sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
 
-static int  setup_listener(uint16_t port);
-static int  receive_payload(int client_fd, uint8_t **buf_out, size_t *len_out);
-static int  dispatch_payload(int client_fd, uint8_t *buf, size_t len);
-static void reap_children(void);
-static void log_message(const char *fmt, ...);
+    memset(&g_log_addr, 0, sizeof(g_log_addr));
+    g_log_addr.sin_family      = AF_INET;
+    g_log_addr.sin_port        = htons(LOG_UDP_PORT);
+    g_log_addr.sin_addr.s_addr = INADDR_BROADCAST;
+}
 
-/* ── Punto de entrada ──────────────────────────────────────────────────── */
+/**
+ * Send a log message via UDP broadcast.
+ * @param msg  Null-terminated string.
+ */
+static void log_send(const char *msg) {
+    if (g_log_sock < 0) return;
+    size_t len = strlen(msg);
+    sendto(g_log_sock, msg, len, 0,
+           (struct sockaddr *)&g_log_addr, sizeof(g_log_addr));
+}
 
-int _start(void) {
-    log_message("ps5-elfldr arrancando en puerto %d", LISTEN_PORT);
+/* ─── Receive helpers ────────────────────────────────────────────────────── */
 
-    /* Primero hacemos el bootstrap en SceRedisServer para persistir */
-    if (pt_bootstrap(TARGET_PROCESS) != 0) {
-        log_message("ADVERTENCIA: no se pudo hacer bootstrap en %s; "
-                    "el loader se ejecutará en el proceso actual", TARGET_PROCESS);
-    } else {
-        log_message("Bootstrap en %s completado", TARGET_PROCESS);
+/**
+ * Receive exactly `len` bytes from `fd` into `buf`.
+ * Returns 0 on success, -1 on error or EOF.
+ */
+static int recv_all(int fd, uint8_t *buf, size_t len) {
+    size_t received = 0;
+    while (received < len) {
+        ssize_t n = recv(fd, buf + received, len - received, 0);
+        if (n <= 0) return -1;
+        received += (size_t)n;
     }
-
-    int srv_fd = setup_listener(LISTEN_PORT);
-    if (srv_fd < 0) {
-        log_message("ERROR: no se pudo crear el socket servidor: %d", errno);
-        return 1;
-    }
-
-    log_message("Escuchando en 0.0.0.0:%d ...", LISTEN_PORT);
-
-    /* Bucle principal: acepta conexiones indefinidamente */
-    for (;;) {
-        /* Limpiar procesos hijo zombie */
-        reap_children();
-
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(srv_fd, (struct sockaddr *)&client_addr, &client_len);
-
-        if (client_fd < 0) {
-            if (errno == EINTR) continue;
-            log_message("accept() falló: %d", errno);
-            continue;
-        }
-
-        log_message("Conexión desde %08x:%d",
-                    client_addr.sin_addr.s_addr,
-                    ntohs(client_addr.sin_port));
-
-        uint8_t *payload_buf = NULL;
-        size_t   payload_len = 0;
-
-        if (receive_payload(client_fd, &payload_buf, &payload_len) == 0) {
-            dispatch_payload(client_fd, payload_buf, payload_len);
-        } else {
-            log_message("Error recibiendo payload");
-        }
-
-        /* payload_buf se libera dentro del proceso hijo si fork() tuvo éxito;
-         * en el padre lo liberamos aquí si dispatch no hizo fork */
-        if (payload_buf) {
-            munmap(payload_buf, payload_len);
-        }
-
-        close(client_fd);
-    }
-
-    /* Nunca se alcanza */
-    close(srv_fd);
     return 0;
 }
 
-/* ── Configuración del socket de escucha ──────────────────────────────── */
-
-static int setup_listener(uint16_t port) {
-    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (fd < 0) return -1;
-
-    /* Permitir reutilizar el puerto inmediatamente */
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-
-    struct sockaddr_in addr = {
-        .sin_family      = AF_INET,
-        .sin_port        = htons(port),
-        .sin_addr.s_addr = INADDR_ANY,
-    };
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    if (listen(fd, LISTEN_BACKLOG) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    return fd;
-}
-
-/* ── Recepción del payload ─────────────────────────────────────────────── */
-
 /**
- * Lee el payload completo del socket.
- * Protocolo: los primeros 4 bytes son el tamaño en little-endian,
- * seguido de los datos del payload. Si el cliente no envía el header
- * de tamaño, leemos hasta que cierre la conexión (modo raw).
+ * Receive a variable-length payload from `fd`.
+ * Reads until the sender closes the connection.
  *
- * Para compatibilidad con netcat simple, soportamos el modo raw:
- * si los primeros bytes son el magic ELF (\x7fELF), leemos hasta EOF.
+ * Returns a malloc'd buffer (caller must free) and sets *out_len.
+ * Returns NULL on error.
  */
-static int receive_payload(int client_fd, uint8_t **buf_out, size_t *len_out) {
-    /* Leer los primeros 4 bytes para determinar el modo */
-    uint8_t header[4];
-    ssize_t n = recv(client_fd, header, sizeof(header), MSG_PEEK | MSG_WAITALL);
-    if (n < 4) return -1;
-
-    size_t expected_size;
-
-    /* Detectar modo por magic bytes */
-    if (header[0] == 0x7F && header[1] == 'E' &&
-        header[2] == 'L'  && header[3] == 'F') {
-        /* Modo raw ELF: leer hasta EOF, máximo MAX_PAYLOAD_SIZE */
-        expected_size = MAX_PAYLOAD_SIZE;
-    } else if (header[0] == 0x00 && header[1] == 'P' &&
-               header[2] == 'S'  && header[3] == 'F') {
-        /* Modo SELF (.self / .sprx firmado) */
-        expected_size = MAX_PAYLOAD_SIZE;
-    } else {
-        /* Modo con header de tamaño: leer 4 bytes de size */
-        recv(client_fd, header, 4, MSG_WAITALL);
-        expected_size = (uint32_t)header[0]
-                      | ((uint32_t)header[1] << 8)
-                      | ((uint32_t)header[2] << 16)
-                      | ((uint32_t)header[3] << 24);
-        if (expected_size == 0 || expected_size > MAX_PAYLOAD_SIZE) {
-            log_message("Tamaño de payload inválido: %zu", expected_size);
-            return -1;
-        }
+static uint8_t *recv_payload(int fd, size_t *out_len) {
+    uint8_t *buf = (uint8_t *)mmap_alloc(RECV_BUF_SIZE);
+    if (!buf) {
+        log_send("[elfldr] [error] Failed to allocate receive buffer");
+        return NULL;
     }
 
-    /* Asignar buffer con mmap para poder ejecutarlo luego */
-    uint8_t *buf = mmap(NULL, expected_size,
-                        PROT_READ | PROT_WRITE,
-                        MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (buf == MAP_FAILED) {
-        log_message("mmap(%zu) falló: %d", expected_size, errno);
-        return -1;
-    }
-
-    /* Leer datos */
     size_t total = 0;
-    while (total < expected_size) {
-        ssize_t received = recv(client_fd, buf + total, expected_size - total, 0);
-        if (received <= 0) break;   /* EOF o error */
-        total += (size_t)received;
+    ssize_t n;
+
+    while (total < RECV_BUF_SIZE) {
+        n = recv(fd, buf + total, RECV_BUF_SIZE - total, 0);
+        if (n == 0) break;   /* sender closed connection — payload complete */
+        if (n < 0) {
+            log_send("[elfldr] [error] recv() failed during payload receive");
+            mmap_free(buf, RECV_BUF_SIZE);
+            return NULL;
+        }
+        total += (size_t)n;
     }
 
     if (total == 0) {
-        munmap(buf, expected_size);
-        return -1;
+        log_send("[elfldr] [warn] Received empty payload");
+        mmap_free(buf, RECV_BUF_SIZE);
+        return NULL;
     }
 
-    log_message("Payload recibido: %zu bytes", total);
-    *buf_out = buf;
-    *len_out = total;
-    return 0;
+    *out_len = total;
+    return buf;
 }
 
-/* ── Despacho del payload ──────────────────────────────────────────────── */
+/* ─── Connection handler ─────────────────────────────────────────────────── */
 
 /**
- * Determina el tipo de payload y lo ejecuta en un proceso hijo.
- * El proceso hijo hereda el contexto jailbroken del padre.
+ * Handle a single incoming connection:
+ *   1. Receive the payload
+ *   2. Detect format (ELF64 / SELF / RAW)
+ *   3. Fork a child process
+ *   4. In the child: load and execute the payload
+ *   5. In the parent: wait for the child and log result
+ *
+ * @param conn_fd  Accepted client socket fd.
+ * @param peer     Client address (for logging).
  */
-static int dispatch_payload(int client_fd, uint8_t *buf, size_t len) {
-    PayloadType type = elfldr_detect_type(buf, len);
+static void handle_connection(int conn_fd, struct sockaddr_in *peer) {
+    char peer_str[32];
+    snprintf(peer_str, sizeof(peer_str), "%s:%d",
+             inet_ntoa(peer->sin_addr), ntohs(peer->sin_port));
 
-    log_message("Tipo detectado: %s",
-                type == PAYLOAD_ELF  ? "ELF"  :
-                type == PAYLOAD_SELF ? "SELF" : "RAW");
+    log_send("[elfldr] Connection from ");
+    log_send(peer_str);
 
-    pid_t child = fork();
-    if (child < 0) {
-        log_message("fork() falló: %d", errno);
-        return -1;
+    size_t   payload_len = 0;
+    uint8_t *payload     = recv_payload(conn_fd, &payload_len);
+    close(conn_fd);
+
+    if (!payload) return;
+
+    /* Detect format */
+    elfldr_fmt_t fmt = elfldr_detect_format(payload, payload_len);
+    const char *fmt_name =
+        fmt == ELFLDR_FMT_ELF64 ? "ELF64" :
+        fmt == ELFLDR_FMT_SELF  ? "SELF"  : "RAW";
+
+    log_send("[elfldr] Payload received, format: ");
+    log_send(fmt_name);
+
+    /* Fork and execute */
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        log_send("[elfldr] [error] fork() failed");
+        mmap_free(payload, RECV_BUF_SIZE);
+        return;
     }
 
-    if (child == 0) {
-        /* ── Proceso hijo ── */
-
-        /* Enviar el fd del cliente al payload para que pueda escribir output */
-        /* (los payloads pueden escribir en stdout → client_fd redirigido)   */
-        dup2(client_fd, STDOUT_FILENO);
-        dup2(client_fd, STDERR_FILENO);
-
-        int ret = elfldr_exec(buf, len, type);
-        _exit(ret);
+    if (pid == 0) {
+        /* ── Child process ── */
+        int rc = elfldr_exec(payload, payload_len, fmt);
+        /* elfldr_exec should not return on success */
+        log_send("[elfldr] [error] elfldr_exec() returned unexpectedly");
+        _exit(rc);
     }
 
-    /* ── Proceso padre ── */
-    log_message("Payload lanzado en PID %d", (int)child);
-    return 0;
+    /* ── Parent process ── */
+    mmap_free(payload, RECV_BUF_SIZE);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    if (WIFEXITED(status)) {
+        log_send("[elfldr] Child exited normally");
+    } else if (WIFSIGNALED(status)) {
+        log_send("[elfldr] [warn] Child killed by signal");
+    }
 }
 
-/* ── Limpieza de procesos hijo ─────────────────────────────────────────── */
-
-static void reap_children(void) {
-    int status;
-    pid_t pid;
-    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        if (WIFEXITED(status)) {
-            log_message("PID %d terminó con código %d",
-                        (int)pid, WEXITSTATUS(status));
-        } else if (WIFSIGNALED(status)) {
-            log_message("PID %d terminado por señal %d",
-                        (int)pid, WTERMSIG(status));
-        }
-    }
-}
-
-/* ── Log ────────────────────────────────────────────────────────────────── */
-
-#include <stdarg.h>
-#include <stdio.h>
+/* ─── Entry point ────────────────────────────────────────────────────────── */
 
 /**
- * Envía un mensaje de log via UDP al PC (puerto 9998).
- * También lo escribe en stderr para depuración local.
+ * Main entry point — called after ptrace injection into SceRedisServer.
+ *
+ * Sets up the TCP listener and enters an accept() loop.
+ * This function is designed to never return.
  */
-static void log_message(const char *fmt, ...) {
-    char buf[512];
-    va_list ap;
+void elfldr_main(void) {
+    log_init();
+    log_send("[elfldr] Loader starting on port 9021...");
 
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
-    va_end(ap);
+    /* Create TCP listening socket */
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        log_send("[elfldr] [fatal] socket() failed");
+        return;
+    }
 
-    if (n < 0) return;
-    buf[n]     = '\n';
-    buf[n + 1] = '\0';
+    int reuse = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-    /* Stderr (visible si hay consola) */
-    write(STDERR_FILENO, buf, n + 1);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(LISTEN_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
 
-    /* UDP al PC — ignoramos errores */
-    static int udp_fd = -1;
-    static struct sockaddr_in pc_addr;
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        log_send("[elfldr] [fatal] bind() failed");
+        close(srv);
+        return;
+    }
 
-    if (udp_fd < 0) {
-        udp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (udp_fd >= 0) {
-            memset(&pc_addr, 0, sizeof(pc_addr));
-            pc_addr.sin_family      = AF_INET;
-            pc_addr.sin_port        = htons(LOG_UDP_PORT);
-            /* Broadcast local — ajustar si se conoce la IP del PC */
-            pc_addr.sin_addr.s_addr = 0xFFFFFFFF; /* 255.255.255.255 */
+    if (listen(srv, LISTEN_BACKLOG) < 0) {
+        log_send("[elfldr] [fatal] listen() failed");
+        close(srv);
+        return;
+    }
+
+    log_send("[elfldr] Listening on port 9021 — ready for payloads");
+
+    /* Accept loop */
+    while (1) {
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof(peer);
+
+        int conn = accept(srv, (struct sockaddr *)&peer, &peer_len);
+        if (conn < 0) {
+            if (errno == EINTR) continue;
+            log_send("[elfldr] [warn] accept() error, continuing...");
+            continue;
         }
+
+        handle_connection(conn, &peer);
     }
 
-    if (udp_fd >= 0) {
-        sendto(udp_fd, buf, n + 1, 0,
-               (struct sockaddr *)&pc_addr, sizeof(pc_addr));
-    }
+    /* Never reached */
+    close(srv);
 }

@@ -1,129 +1,180 @@
-# Guía de offsets — Cómo encontrar offsets para otros firmwares
+# Offsets Guide — Finding FW 11.00 Values with Ghidra
+# Guía de Offsets — Encontrar Valores de FW 11.00 con Ghidra
 
-Esta guía explica el proceso de encontrar y actualizar los offsets
-necesarios cuando el toolkit se porta a un firmware diferente.
+> [English](#english) · [Español](#español)
 
-## Herramientas necesarias
+---
 
-- **Ghidra** (con el script PS5 de Specter para importar SPRX/PRX)
-- **ps5-payload-sdk** para compilar herramientas de diagnóstico
-- **radare2** o **IDA Pro** (opcional)
-- Dump del firmware objetivo (extracción del disco de la PS5)
+<a name="english"></a>
+# ENGLISH
 
-## 1. Obtener el dump del firmware
+## Prerequisites
 
-El firmware puede extraerse del disco de actualización `.PUP` con herramientas
-como `pup_unpacker`. Los módulos relevantes están en:
+- Ghidra 11.x (free, from NSA/GitHub)
+- ps5-ghidra-scripts (community scripts that add PS5 binary support)
+- A dump of the FW 11.00 WebKit binary (`WebKit.sprx` / renderer process)
+- A dump of FW 11.00 `libkernel_web.sprx`
 
-```
-/system/lib/libkernel.sprx
-/system/priv/lib/libSceWebKit2.sprx
-```
+> **How to obtain dumps:** You need a PS5 on FW 11.00 or earlier with a currently
+> working kernel exploit (e.g., from SpecterDev's repository for older firmware).
+> Dumping is outside the scope of this guide.
 
-## 2. Offsets de libkernel
+---
 
-### Thread list (`OFFSETS.libkernel.thread_list`)
+## Finding WEBKIT_GOT_LIBKERNEL
 
-En Ghidra, busca la función `pthread_create`. Dentro de ella, hay una
-instrucción que inserta el nuevo thread en una lista enlazada global.
-El puntero a esa lista es `thread_list`.
+This offset tells us where in WebKit's binary a pointer to a libkernel function is stored.
 
-También puedes buscarlo con el pattern `LIST_INSERT_HEAD` en el código
-desensamblado.
+**In Ghidra:**
 
-### Offsets en `pthread_t` (`pthread_next`, `pthread_stack_addr`, etc.)
+1. Open `WebKit.sprx` (or the renderer binary). Apply the PS5 loader script.
+2. Open **Symbol Tree → Imports**. Look for imports from `libkernel_web.sprx`.
+3. Find a commonly imported function: `pthread_create`, `mmap`, `munmap`, or `write`.
+4. Right-click the import symbol → **References → Show References to**.
+5. Find the GOT entry (in the `.got` section) — it will have a data cross-reference.
+6. Note the address of that GOT slot. Subtract the binary's load address (usually starts
+   at `0x00000000` in Ghidra's default analysis) to get the offset.
+7. Record this as `WEBKIT_GOT_LIBKERNEL` plus which function it points to, so you can
+   compute: `libkernel_base = *WEBKIT_GOT_LIBKERNEL - LIBKERNEL_FUNC_OFFSET`
 
-La estructura `pthread` de FreeBSD es pública. Sin embargo, los offsets
-pueden cambiar entre versiones de Orbis. Para verificarlos:
+---
 
-1. Compila un payload que haga `pthread_create()` y duerma.
-2. Adjúntate con ptrace y lee la estructura del thread.
-3. Compara con los offsets esperados de la estructura `pthread_t` de FreeBSD 11.
+## Finding ROP Gadgets in libkernel_web.sprx
 
-### Gadgets ROP
-
-Los gadgets se encuentran en las secciones ejecutables de libkernel.
-En Ghidra, usa `Search → For Instruction Patterns`:
-
-```
-pop RDI ; RET               → pop_rdi_ret
-pop RSP ; RET               → pop_rsp_ret
-mov QWORD PTR [RDI], RAX   → escribir RAX en memoria
-syscall ; RET               → entrada directa a syscall
+**Method 1: ROPgadget (command line)**
+```bash
+# Extract the binary from your dump first
+ROPgadget --binary libkernel_web.sprx --rop --depth 3 | grep -E "pop rdi|pop rsi|syscall"
 ```
 
-Herramienta automatizada: `ROPgadget --binary libkernel.sprx --rop`
+**Method 2: Ghidra Search**
+1. Open `libkernel_web.sprx`
+2. **Search → For Instruction Patterns**
+3. Search for byte sequence: `5F C3` (pop rdi; ret on x86-64)
+4. For each result: note the address, subtract the binary's base address → that's your offset
 
-### Syscall stubs
+**Common gadget byte patterns (x86-64):**
+| Gadget | Bytes |
+|--------|-------|
+| `pop rdi; ret` | `5F C3` |
+| `pop rsi; ret` | `5E C3` |
+| `pop rdx; ret` | `5A C3` |
+| `pop rcx; ret` | `59 C3` |
+| `pop r8; ret`  | `41 58 C3` |
+| `pop r9; ret`  | `41 59 C3` |
+| `pop rax; ret` | `58 C3` |
+| `syscall; ret` | `0F 05 C3` |
+| `ret`          | `C3` |
 
-En libkernel, cada syscall tiene un stub que contiene la instrucción
-`syscall`. Busca la función por nombre (ej. `socket`, `mmap`) y anota
-el offset desde el inicio del módulo.
+For the stack pivot, search for `xchg rsp,` sequences:
+```
+48 94 C3   (xchg rsp, rax; ret)
+48 87 E3   (xchg rsp, rbx; ...)
+```
+Pick one that lands in a predictable state.
 
-## 3. Offsets de WebKit
+---
 
-### `worker_ret_offset`
+## Finding JSC ArrayBuffer Offsets
 
-Este es el offset más crítico y más difícil de encontrar.
+1. Open the WebKit binary in Ghidra
+2. Search for the `JSArrayBuffer::create` function (search by name if symbols are present,
+   or by pattern if stripped)
+3. Examine how it initialises the object — the field write sequence reveals the struct layout
+4. Alternatively, search for the string `"ArrayBuffer"` — it appears near the structure
+   definition in JSC's type system
 
-**Método 1 (empírico):**
-1. Crea un Web Worker con un handler `onmessage` que haga un sleep largo.
-2. Adjúntate al proceso WebKit con ptrace.
-3. Encuentra el stack del worker (tamaño = 0x80000).
-4. Examina el stack cuando el handler está a punto de retornar.
-5. Busca la dirección de retorno del handler `onmessage`.
+The backing store offset (currently `0x10` in our scaffold) is the most critical one.
+Verify it by finding where `JSArrayBuffer` sets its `m_impl` or equivalent pointer field.
 
-**Método 2 (análisis estático):**
-1. En Ghidra, busca la función `Worker::didReceiveMessageOnWorkerGlobalScope`.
-2. Analiza el frame del stack de esa función.
-3. El offset del return address se puede calcular del prologue.
+---
 
-### `gadget_pop_rsp_ret` en WebKit
+## Verifying Kernel Offsets
 
-Busca en la sección ejecutable de libSceWebKit2.sprx el patrón:
-`5C 5C C3` (pop rsp ; ret en x64, puede variar).
+Kernel offsets are best verified using existing open-source PS5 kernel dumps/analyses:
 
-## 4. Offsets del kernel
+- SpecterDev's kernel exploit releases include offset tables for each supported firmware
+- The ps5-kernel-offsets community repository tracks per-firmware offsets
+- Cross-reference with FreeBSD 9.0 source (PS4/PS5 Orbis OS is based on FreeBSD)
 
-Los offsets del kernel son los más difíciles porque requieren un dump del
-kernel (disponible sólo post-jailbreak de otra consola o de firmware similar).
+For FW 11.00 specifically, check whether any public kernel exploit already documents
+the `proc`, `ucred`, and `prison` struct offsets.
 
-### Proceso general:
-1. Dumpea el kernel de una consola ya jailbroken con firmware cercano.
-2. En Ghidra, importa el kernel (script de PS5 requerido).
-3. Busca los símbolos por sus patrones de código:
-   - `allproc`: lista enlazada de todos los procesos, accesible vía `sysctl kern.proc`
-   - `kern.securelevel`: variable global patcheable
-   - CPU info structs: se encuentran buscando referencias a MSR reads de Zen 2
+---
 
-### Verificación de offsets del kernel
+<a name="español"></a>
+# ESPAÑOL
 
-Una vez jailbroken, puedes verificar offsets con un payload que:
-1. Lea el kbase (ya conocido tras el exploit).
-2. Lea la dirección de `allproc` en `kbase + offset_candidato`.
-3. Verifique que sea un puntero válido al proceso actual.
+## Requisitos
 
-## 5. Proceso de actualización de offsets_XXXX.js
+- Ghidra 11.x (gratuito, de NSA/GitHub)
+- ps5-ghidra-scripts (scripts de la comunidad que añaden soporte de binarios PS5)
+- Un dump del binario WebKit de FW 11.00 (`WebKit.sprx` / proceso renderizador)
+- Un dump de `libkernel_web.sprx` de FW 11.00
 
-1. Crea una copia de `offsets_1100.js` con el nuevo nombre de FW.
-2. Actualiza cada offset con los valores encontrados.
-3. En `exploit/index.html`, cambia el `<script src>` al nuevo archivo.
-4. Prueba con un exploit que sólo haga el leak de libkBase y muestre el valor.
-5. Verifica con el payload de hello que el ROP funciona.
-6. Avanza fase por fase.
+> **Cómo obtener dumps:** Necesitas una PS5 en FW 11.00 o anterior con un exploit de kernel
+> actualmente funcional (p.ej., del repositorio de SpecterDev para firmware anterior).
+> El proceso de dump está fuera del alcance de esta guía.
 
-## 6. Herramienta de verificación
+---
 
-El toolkit incluye un modo de diagnóstico que se puede activar en el exploit:
+## Encontrar WEBKIT_GOT_LIBKERNEL
 
-```javascript
-// En exploit/index.html, añadir antes del botón:
-const DEBUG_MODE = true;  // Solo hace el leak, no escalada
+Este offset indica dónde en el binario de WebKit está almacenado un puntero a una función de libkernel.
 
-// Si DEBUG_MODE, solo ejecutar fases 1-2 y mostrar:
-console.log("libkBase:", libkBase.toString());
-console.log("workerStack:", workerStack.toString());
+**En Ghidra:**
+
+1. Abre `WebKit.sprx`. Aplica el script del cargador PS5.
+2. Abre **Symbol Tree → Imports**. Busca importaciones de `libkernel_web.sprx`.
+3. Encuentra una función importada habitual: `pthread_create`, `mmap`, `munmap`, o `write`.
+4. Click derecho en el símbolo de importación → **References → Show References to**.
+5. Encuentra la entrada de la GOT (en la sección `.got`) — tendrá una referencia cruzada de datos.
+6. Anota la dirección de ese slot de la GOT. Resta la dirección de carga del binario para obtener el offset.
+7. Registra esto como `WEBKIT_GOT_LIBKERNEL` más qué función apunta, para poder calcular:
+   `base_libkernel = *WEBKIT_GOT_LIBKERNEL - LIBKERNEL_FUNC_OFFSET`
+
+---
+
+## Encontrar Gadgets ROP en libkernel_web.sprx
+
+**Método 1: ROPgadget (línea de comandos)**
+```bash
+ROPgadget --binary libkernel_web.sprx --rop --depth 3 | grep -E "pop rdi|pop rsi|syscall"
 ```
 
-Esto permite verificar que los offsets básicos son correctos antes de
-intentar la escalada completa.
+**Método 2: Búsqueda en Ghidra**
+1. Abre `libkernel_web.sprx`
+2. **Search → For Instruction Patterns**
+3. Busca la secuencia de bytes: `5F C3` (pop rdi; ret en x86-64)
+4. Para cada resultado: anota la dirección, resta la dirección base del binario → ese es tu offset
+
+**Patrones de bytes de gadgets habituales (x86-64):**
+| Gadget | Bytes |
+|--------|-------|
+| `pop rdi; ret` | `5F C3` |
+| `pop rsi; ret` | `5E C3` |
+| `pop rdx; ret` | `5A C3` |
+| `pop rcx; ret` | `59 C3` |
+| `pop r8; ret`  | `41 58 C3` |
+| `pop r9; ret`  | `41 59 C3` |
+| `pop rax; ret` | `58 C3` |
+| `syscall; ret` | `0F 05 C3` |
+| `ret`          | `C3` |
+
+Para el pivote de stack, busca secuencias `xchg rsp,`:
+```
+48 94 C3   (xchg rsp, rax; ret)
+```
+
+---
+
+## Verificar Offsets de Kernel
+
+Los offsets de kernel se verifican mejor usando análisis/dumps de kernel de PS5 de código abierto existentes:
+
+- Los lanzamientos de exploits de kernel de SpecterDev incluyen tablas de offsets para cada firmware
+- El repositorio de la comunidad ps5-kernel-offsets rastrea offsets por firmware
+- Haz referencias cruzadas con el código fuente de FreeBSD 9.0 (Orbis OS está basado en FreeBSD)
+
+Para FW 11.00 específicamente, comprueba si algún exploit de kernel público ya documenta
+los offsets de las estructuras `proc`, `ucred` y `prison`.

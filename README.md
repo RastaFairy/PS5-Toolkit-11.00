@@ -1,398 +1,190 @@
-<div align="center">
+# PS5-Toolkit — WebKit Research Scaffold for FW 11.xx
 
-<br/>
-
-**WebKit-based arbitrary code execution & payload injection toolkit for PS5 firmware 11.xx**
-
-<br/>
-
-[![Firmware](https://img.shields.io/badge/Firmware-11.00-00b4d8?style=flat-square&logo=playstation)](.)
-[![Architecture](https://img.shields.io/badge/Arch-FreeBSD%20AMD64-6060a0?style=flat-square)](.)
-[![Language](https://img.shields.io/badge/Lang-C%20%7C%20JS%20%7C%20Python-ffe600?style=flat-square)](.)
-[![License](https://img.shields.io/badge/License-GPLv3-00ffaa?style=flat-square)](./LICENSE)
-[![Status](https://img.shields.io/badge/Status-Research-ff3c78?style=flat-square)](.)
-
-<br/>
-
-[Architecture](#architecture) · [Quick Start](#quick-start) · [Credits](#credits)
-
-<br/>
-
-> **Español** → [README_ES.md](./README_ES.md)
-
-</div>
+> **Español** → [README_ES.md](README_ES.md)  
+> **Non-developers** → [docs/GUIDE_NONTECHNICAL.md](docs/GUIDE_NONTECHNICAL.md)  
+> **Full technical honesty** → [HONEST_LIMITATIONS.md](HONEST_LIMITATIONS.md)
 
 ---
 
-# PS5 Toolkit 11.00
+## Before anything else
 
-> **Firmware:** 11.00 · **Bug:** CVE-2023-41993 (DFG JIT type confusion) · **Platform:** FreeBSD/AMD64
+This project is **not a working exploit**. It is a documented research scaffold.
 
-Security research toolkit for PS5 FW 11.00. Covers the full exploit chain from the WebKit bug to arbitrary ELF payload execution, with automated firmware binary analysis tools.
+Several projects circulating in the PS5 community present code structured like this
+as functional exploits. They are not, and neither is this one. The difference here
+is that we document exactly what is missing and why, rather than obscuring it.
 
-```
-WebKit bug → addrof/fakeobj → arbitrary R/W → ROP chain → kernel jailbreak → ELF loader
-```
+**If a project claims to be a working FW 11.xx WebKit exploit and does not show you
+a video of it running on real hardware — assume it has the same holes this one does.**
 
----
-
-## Project Status
-
-| Component | Status | Notes |
-|---|:---:|---|
-| `webkit_bug.js` — CVE-2023-41993 | ✅ | DFG JIT type confusion, 4 phases, 3 auto-retries |
-| `leakLibKernelBase()` | ✅ | GOT read via RegExpObject vtable |
-| `primitives.js` — arbitrary R/W | ✅ | Fake Float64Array, vector overwrite |
-| `rop.js` — Worker stack pivot | ✅ | `thread_list` → Worker → pivot |
-| `kernel.js` — jailbreak + root | ✅ | `allproc` → `ucred` → uid=0 + prison0 |
-| `loader.js` + `elfldr/` | ✅ | ptrace into SceRedisServer, TCP :9021 |
-| `tools/` — binary analysis | ✅ | 7 Python scripts, no external deps |
-| `offsets_1100.js` | ⚠ | Run `gen_offsets.py` against real `.elf` files to confirm values |
-
-**Only remaining manual step:** obtain FW 11.00 binaries and run `tools/gen_offsets.py`.
-Everything else is implemented and wired together.
+The full breakdown of what is broken and why is in [HONEST_LIMITATIONS.md](HONEST_LIMITATIONS.md).
 
 ---
 
-## Table of Contents
+## What this project actually contains
 
-1. [Requirements](#requirements)
-2. [Quick Start](#quick-start)
-3. [Architecture](#architecture)
-4. [The Bug — CVE-2023-41993](#the-bug--cve-2023-41993)
-5. [Exploit Chain](#exploit-chain)
-6. [Project Structure](#project-structure)
-7. [Analysis Tools](#analysis-tools)
-8. [Building the ELF Loader](#building-the-elf-loader)
-9. [Sending Payloads](#sending-payloads)
-10. [Verifying Offsets](#verifying-offsets)
-11. [Runtime Tuning](#runtime-tuning)
-12. [FAQ](#faq)
-13. [Credits](#credits)
+A complete, architecturally correct scaffold for a WebKit-based exploit chain on
+PlayStation 5 firmware 11.xx. Every module is implemented **except the pieces that
+require binary analysis of a real FW 11.00 dump**:
 
----
+| Component | State | What blocks it |
+|---|---|---|
+| `triggerWebKitBug()` | ❌ TODO | FW 11.00 WebKit binary analysis |
+| `leakLibKernelBase()` | ❌ TODO | GOT pointer from FW 11.00 WebKit binary |
+| All ROP gadget offsets | ❌ `0x0` | `libkernel_web.sprx` extraction + ROPgadget |
+| `_pipeRead8/Write8` | ❌ Empty stubs | `pipe_buffer` layout from kernel binary |
+| `_ropMmap()` | ❌ Returns `0x0` | `mov [mem], rax` gadget offset |
+| `pt.c` spin-wait | ⚠️ Unreliable | `nanosleep`/`sched_yield` offsets |
+| ELF64 parser (`elfldr.c`) | ✅ Functional | No firmware dependency |
+| `int64.js` | ✅ Functional | No firmware dependency |
+| Host tools | ✅ Functional | No firmware dependency |
+| ROP chain builder logic | ✅ Correct | Blocked only by missing offsets |
+| Kernel escalation logic | ✅ Correct | Blocked only by missing primitives |
 
-## Requirements
-
-### PC / host
-
-- Python 3.8+
-- `binutils` (readelf, objdump, nm, strings) for the analysis tools
-- Local network access to the PS5
-
-```bash
-# Automated setup (detects Debian/Ubuntu/macOS/Arch):
-bash setup.sh
-
-# Manual:
-sudo apt install python3 binutils   # Debian/Ubuntu
-brew install binutils               # macOS
-```
-
-### PS5
-
-- Firmware **11.00** exactly (not 10.xx, not 11.01+)
-- PS5 browser with local network access
+The single root cause for everything in that table is the same:
+**`offsets_1100.js` has every critical value set to `0x00000000`** because
+those values require a decrypted firmware dump that this project does not have.
 
 ---
 
-## Quick Start
+## Technical corrections vs. prior circulating code
 
-```bash
-# 1. Clone and configure
-git clone https://github.com/RastaFairy/PS5-Toolkit-11.00
-cd PS5-Toolkit-11.00
-bash setup.sh          # auto-detects local IP and patches HOST_IP in sources
+### ❌ No JIT in the PS5 browser
 
-# 2. Start the HTTP server
-python3 host/server.py --port 8000
+The PS5 browser launches WebKit with `ENABLE_JIT=OFF`. There is no JIT compiler,
+no DFG tier, no FTL tier. Any project describing a "DFG JIT type confusion" exploit
+targeting the PS5 browser is technically wrong by definition.
 
-# 3. On the PS5: browser → http://YOUR_PC_IP:8000/exploit/index.html
+> Confirmed in PS4 source code at ps4-oss.com from FW 6.00 onwards.
 
-# 4. Live logs (separate terminal)
-python3 tools/listen_log.py
+### ❌ SharedArrayBuffer is disabled
 
-# 5. Send payloads once the loader is active
-python3 tools/send_payload.py --host PS5_IP --file my_payload.elf
-```
+`new SharedArrayBuffer()` throws in the PS5 browser. This project uses plain
+`ArrayBuffer` objects and `performance.now()` for timing. No `Atomics` anywhere.
+
+### ❌ Not V8
+
+The PS5 uses JavaScriptCore (JSC), not V8. V8-specific techniques — TurboFan,
+Liftoff, Sparkplug, V8 heap layout — are irrelevant here.
+
+### ✅ What is actually correct
+
+- Engine: JavaScriptCore (JSC), interpreter-only (LLInt)
+- Exploitation primitive: ArrayBuffer length/pointer corruption via JSC type confusion
+- Code execution: ROP-only, gadgets sourced from `libkernel_web.sprx`
+- Timing: `performance.now()` / `Date.now()` delta loops
+- Architecture: FreeBSD AMD64 (Orbis OS)
+
+---
+
+## What the exploit chain does (when complete)
+
+Starting from a type confusion in JSC (same class as CVE-2021-30889, active in FW 11.x):
+
+1. **Userland R/W** — corrupt an ArrayBuffer's backing store pointer → `read8`/`write8`
+2. **libkernel base leak** — read a GOT entry in WebKit pointing into libkernel
+3. **ROP chain** — gadget chain via Web Worker stack pivot, bypassing Clang forward-edge CFI
+4. **Kernel escalation** — umtx UAF → pipe trick kernel R/W → root → jail escape
+5. **Persistent loader** — ptrace inject into `SceRedisServer` → TCP listener on port 9021
+6. **Payload execution** — send `.elf`/`.bin`/`.self` from PC, PS5 executes it
 
 ---
 
 ## Architecture
 
 ```
-PC (host)                                  PS5 (FW 11.00)
-─────────────────────────────────────────────────────────
-host/server.py ────── HTTP :8000 ──────► WebKit browser
-                                                │
-                                       exploit/index.html
-                                                │
-                                    ┌───────────▼───────────┐
-                                    │  webkit_bug.js         │
-                                    │  CVE-2023-41993        │
-                                    │  → leakobj / fakeobj   │
-                                    └───────────┬───────────┘
-                                    ┌───────────▼───────────┐
-                                    │  primitives.js         │
-                                    │  → read8 / write8      │
-                                    └───────────┬───────────┘
-                                    ┌───────────▼───────────┐
-                                    │  rop.js                │
-                                    │  Worker stack pivot    │
-                                    └───────────┬───────────┘
-                                    ┌───────────▼───────────┐
-                                    │  kernel.js             │
-                                    │  allproc → ucred → 0   │
-                                    └───────────┬───────────┘
-                                    ┌───────────▼───────────┐
-                                    │  loader.js             │
-                                    │  ptrace → SceRedis     │
-                                    └───────────┬───────────┘
-                                                │
-send_payload.py ───── TCP :9021 ───────────────►│
-listen_log.py   ◄──── UDP :9998 ────────────────┘
-```
-
-| Port | Proto | Direction | Purpose |
-|------|-------|-----------|---------|
-| 8000 | HTTP | PC → PS5 | Serves `exploit/` to the browser |
-| 9021 | TCP | PC → PS5 | Payload delivery to the ELF loader |
-| 9998 | UDP | PS5 → PC | Real-time exploit logs |
-
----
-
-## The Bug — CVE-2023-41993
-
-**Type:** Type confusion in the JavaScriptCore DFG compiler
-**Affects:** WebKit < iOS 17.0.3 / Safari 17.0.1 → PS5 FW 10.xx–11.02 (unpatched)
-**Ref:** [bugs.webkit.org/260664](https://bugs.webkit.org/show_bug.cgi?id=260664)
-
-The DFG compiler tracks an abstract value for each IR graph node. Once it has observed a property containing only doubles, it emits code that reads the slot directly without a type check (type speculation). On certain `GetByOffset/PutByOffset` paths over objects with transitional structures, `clobberize()` fails to mark those reads as heap-reads. The compiler then hoists the read above side effects that change the slot's type.
-
-**Result:**
-
-```
-Warmup (100 iters) →  confused.val = double    [JIT compiles as double read]
-Trigger            →  confused.val = JSObject*  [breaks the type invariant]
-jitCompiledRead()  →  returns JSObject* as double  →  leakobj(obj) ✓
-jitCompiledWrite() →  writes addr as double        →  fakeobj(addr) ✓
+┌─────────────────────────────────────────────────────────────┐
+│  HOST PC                         PS5 (FW 11.00 / Orbis OS) │
+│                                                             │
+│  host/server.py ─── HTTP :8000 ──► WebKit Browser          │
+│       │                                  │                  │
+│       │                           exploit/js/*.js           │
+│       │                                  │                  │
+│       │                           kernel.js                 │
+│       │                           (kbase, R/W, root)        │
+│       │                                  │                  │
+│       │  ◄── fetch elfldr.elf ───────────┤                  │
+│       │                           loader.js                 │
+│       │                                  │                  │
+│       │                           SceRedisServer            │
+│       │                           └─ elfldr :9021           │
+│       │                                                      │
+│  tools/send_payload.py ─ TCP :9021 ──► fork() + exec        │
+│  tools/listen_log.py   ◄─ UDP :9998 ── broadcast logs       │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Exploit Chain
-
-### Phase 1 — WebKit bug → base primitives
-
-1. **Heap spray** — 0x800 `ArrayBuffer`s of 64 bytes position the allocator bump pointer
-2. **Confusion objects** — `confused/container` pair with 3 controlled structure transitions that activate the vulnerable `clobberize()` path in the DFG
-3. **JIT warmup** — 100 iterations embed the "double" type speculation in compiled DFG code
-4. **Trigger** — JSObject\* placed in the double slot → `leakobj` + `fakeobj`; up to 3 automatic retries
-
-### Phase 2 — Full memory primitives
-
-`fakeobj` constructs a fake `Float64Array`. By overwriting its `vector` field (+0x10) we point the view at any process address. API: `addrof`, `read8`, `write8`, `read4`, `write4`, `readBytes`, `writeBytes`, `readCString`.
-
-### Phase 3 — libkBase leak and stack pivot
-
-1. `addrof(new RegExp('a'))` → address of the `RegExpObject`
-2. Read internal `JSRegExp*` (inline slot +0x10) → read C++ vtable → subtract `vtable_jsregexp_offset` → `webkit_base`
-3. Read `GOT[pthread_create]` at `webkit_base + got_pthread_create` → subtract libkernel symbol offset → `libkBase`
-4. Walk `thread_list` to find the Web Worker thread by `stack_size == 0x80000`
-5. Overwrite `worker_ret_offset` → pivot to the ROP chain
-
-### Phase 4 — Kernel jailbreak
-
-1. Leak `kbase` via `umtx_op` syscall
-2. Walk `allproc` to locate the WebKit process by PID
-3. Patch `p_ucred`: `cr_uid = 0`, `cr_ruid = 0`, `cr_svuid = 0`, `cr_prison = &prison0`
-
-### Phase 5 — Persistent ELF loader
-
-1. Download `elfldr.elf` from the HTTP server
-2. Inject into `SceRedisServer` via ptrace (shellcode + detach)
-3. Loader listens on TCP :9021 as long as Redis keeps running
-
----
-
-## Project Structure
+## Project structure
 
 ```
-PS5-Toolkit-11.00/
+PS5-Toolkit/
 │
-├── exploit/                        WebKit exploit (served as a web page)
-│   ├── index.html                  5-phase orchestrator UI with progress bar and logs
+├── README.md                     ← This file (English)
+├── README_ES.md                  ← Spanish version
+├── HONEST_LIMITATIONS.md         ← Detailed breakdown of what is broken and why
+│
+├── docs/
+│   ├── GUIDE_NONTECHNICAL.md     ← For non-developers (EN/ES)
+│   ├── architecture.md           ← Deep technical write-up (EN/ES)
+│   └── offsets_guide.md          ← How to find offsets with Ghidra (EN/ES)
+│
+├── exploit/
+│   ├── index.html                ← Exploit UI served to PS5 browser
 │   └── js/
-│       ├── int64.js                64-bit integer arithmetic, JSC NaN-boxing helpers
-│       ├── offsets_1100.js         All FW 11.00 offsets
-│       ├── webkit_bug.js           CVE-2023-41993 trigger + leakLibKernelBase()
-│       ├── primitives.js           Primitives class: addrof / read8 / write8
-│       ├── rop.js                  ROPChain builder + Worker pivot
-│       ├── rop_worker.js           Victim Web Worker (stack pivot target)
-│       ├── kernel.js               KernelExploit: kbase leak + jailbreak
-│       └── loader.js               PayloadLoader: ptrace + elfldr
+│       ├── int64.js              ← 64-bit integer helpers            ✅
+│       ├── offsets_1100.js       ← FW 11.00 offsets (all 0x0)       ❌
+│       ├── primitives.js         ← triggerWebKitBug() stub           ❌
+│       ├── rop.js                ← leakLibKernelBase() stub          ❌
+│       ├── kernel.js             ← Kernel logic ✅ — pipe R/W stubs  ❌
+│       └── loader.js             ← ELF delivery — missing gadgets    ❌
 │
-├── elfldr/                         Native ELF loader (C)
-│   ├── elfldr.c / elfldr.h         ELF64 parser + relocations
-│   ├── main.c                      TCP :9021 listener loop
-│   ├── pt.c / pt.h                 ptrace bootstrap into SceRedisServer
-│   └── Makefile
-│
-├── payload/example/                Example payload
-│   ├── hello.c                     Sends a UDP message to the host PC
+├── elfldr/
+│   ├── main.c                    ← TCP listener :9021                ✅
+│   ├── elfldr.c / elfldr.h       ← ELF64/SELF/RAW parser            ✅
+│   ├── pt.c / pt.h               ← ptrace injection ✅ spin-wait     ⚠️
 │   └── Makefile
 │
 ├── host/
-│   └── server.py                   HTTP server with COOP/COEP/CORS for SharedArrayBuffer
+│   └── server.py                 ← HTTP server                       ✅
 │
-├── tools/                          Automated firmware binary analysis
-│   ├── self2elf.py                 SELF/SPRX → ELF (single file or batch)
-│   ├── analyze_libkernel.py        ROP gadgets, symbols, pthread offsets
-│   ├── analyze_webkit.py           GOT entries for libkBase leak
-│   ├── analyze_kernel.py           allproc, ucred, prison0
-│   ├── gen_offsets.py              Orchestrator → generates complete offsets_1100.js
-│   ├── send_payload.py             Sends payloads to the ELF loader (TCP :9021)
-│   ├── listen_log.py               Colored UDP log receiver
-│   └── ANALYSIS_README.md
-│
-├── docs/
-│   ├── architecture.md             Deep technical write-up of the full chain
-│   └── offsets_guide.md            Step-by-step guide to extracting and verifying offsets
-│
-├── .github/ISSUE_TEMPLATE/
-│   ├── bug_report.md
-│   └── offsets.md
-│
-├── setup.sh                        Multi-OS automated installer
-├── CONTRIBUTING.md
-├── CHANGELOG.md
-└── LICENSE                         GPLv3
+└── tools/
+    ├── send_payload.py           ← Send payloads to PS5              ✅
+    └── listen_log.py             ← Receive UDP logs                  ✅
 ```
 
 ---
 
-## Analysis Tools
+## How to contribute
 
-Once you have the firmware binaries, a single command generates a complete `offsets_1100.js`:
+The most valuable contribution is filling in `offsets_1100.js`.
 
-```bash
-# Convert SPRX → ELF first (if you have .sprx files)
-python3 tools/self2elf.py libkernel.sprx libkernel.elf
-python3 tools/self2elf.py WebKit.sprx    WebKit.elf
-# or process an entire directory at once:
-python3 tools/self2elf.py --dir /path/to/priv/lib/ --out ./elfs/
+If you have access to a FW 11.00 dump and have done any of the following,
+a pull request with verified values is more useful than anything else:
 
-# Generate complete offsets_1100.js
-python3 tools/gen_offsets.py \\
-    --libkernel libkernel.elf \\
-    --webkit    WebKit.elf \\
-    --kernel    mini-syscore.elf \\
-    --out       exploit/js/offsets_1100.js
-```
+- Identified a JSC type confusion bug active in FW 11.00 WebKit
+- Found a `libkernel_web.sprx` GOT pointer in the WebKit binary
+- Run ROPgadget against `libkernel_web.sprx` for FW 11.00
+- Identified `pipe_buffer` struct offsets in the FW 11.00 kernel
+- Found `proc`/`ucred`/`prison` struct offsets in FW 11.00
 
-Individual scripts for deeper inspection:
-
-```bash
-python3 tools/analyze_libkernel.py libkernel.elf --verbose
-python3 tools/analyze_webkit.py    WebKit.elf --libkernel libkernel.elf
-python3 tools/analyze_kernel.py    mini-syscore.elf
-```
-
-No pip dependencies — only `objdump`, `readelf`, `nm`, `strings` (standard binutils).
-
----
-
-## Building the ELF Loader
-
-```bash
-bash setup.sh --sdk          # clones ps5-payload-sdk into /opt/ps5-payload-sdk
-
-cd elfldr/ && make           # builds elfldr.elf
-cd payload/example/ && make  # builds the example hello.elf
-```
-
----
-
-## Sending Payloads
-
-```bash
-python3 tools/send_payload.py --host 192.168.1.50 --file my_payload.elf
-python3 tools/send_payload.py --host 192.168.1.50 --file shellcode.bin
-```
-
-The loader auto-detects the payload type by magic bytes:
-
-| Magic | Type | Processing |
-|---|---|---|
-| `\\x7fELF` | ELF64 | Parse PHDRs, mmap, relocations, call `_init` + entry |
-| `\\x4fSCE` | SELF | Strip SELF header, load as ELF |
-| Anything else | RAW | Map directly into executable memory |
-
----
-
-## Verifying Offsets
-
-Values marked `// ⚠ VERIFY` in `offsets_1100.js` are estimates derived from static analysis and earlier firmware versions. They may work or cause silent crashes. To confirm them:
-
-```bash
-python3 tools/gen_offsets.py --libkernel libkernel.elf --webkit WebKit.elf
-```
-
-The only offset that always requires empirical verification on hardware is `worker_ret_offset` — see `docs/offsets_guide.md`.
-
----
-
-## Runtime Tuning
-
-From the PS5 WebInspector console, without reloading the page:
-
-```javascript
-// Inspect all current offsets
-console.log(JSON.stringify(OFFSETS, null, 2))
-
-// Patch an offset on the fly
-patchOffset('webkit.got_pthread_create', 0x9B3C820)
-patchOffset('webkit.worker_ret_offset',  0x7FB88)
-patchOffset('libkernel.pthread_create',  0x9CBB0)
-```
-
----
-
-## FAQ
-
-**The exploit fails at Phase 1**
-The heap spray is non-deterministic. Reload the page. If it fails consistently, increase `JIT_WARMUP_ITERS` or `SPRAY_COUNT` in `webkit_bug.js`.
-
-**The browser crashes at Phase 3**
-`worker_ret_offset` is likely wrong. Use `patchOffset` with values ±0x8 or ±0x10 and retry.
-
-**Are the ⚠ VERIFY offsets usable as-is?**
-They are estimates based on static analysis and previous firmware. The exploit may work or fail silently. Run `gen_offsets.py` with the real binaries for exact values.
-
-**Does the loader survive rest mode?**
-Yes, as long as `SceRedisServer` keeps running. A full reboot requires re-running the exploit.
-
-**Why CVE-2023-41993 and not the FW 4.03 bug?**
-CVE-2021-30889 (used by ChendoChap on FW 4.03) is patched in FW 11.xx. CVE-2023-41993 is the active bug across the 10.xx–11.02 range.
-
-**Does it work on FW 11.01 / 11.02?**
-CVE-2023-41993 was not patched until after 11.02, so likely yes. Offsets may differ — run `gen_offsets.py` with that firmware's binaries.
-
-**I have the firmware `.elf` files. What do I do?**
-Upload them to this chat. The analysis scripts will run directly against them and produce a verified `offsets_1100.js`.
+See [docs/offsets_guide.md](docs/offsets_guide.md) for the step-by-step Ghidra workflow.
 
 ---
 
 ## Credits
 
-- **ChendoChap & Znullptr** — [PS5-Webkit-Execution](https://github.com/ChendoChap/PS5-Webkit-Execution) — primitives structure and Worker pivot technique
-- **john-tornblom** — [ps5-payload-elfldr](https://github.com/ps5-payload-dev/elfldr), [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk) — ELF loader and payload SDK
-- **SpecterDev** — PSFree, PS5-IPV6-Kernel-Exploit — kernel jailbreak reference
-- **sleirsgoevy** — [ps4jb2](https://github.com/sleirsgoevy/ps4jb2) — GOT leak technique for libkernel
-- **flatz** — ps5_tools — PS5 SELF format analysis tools
-- **po6ix** — initial CVE-2023-41993 PoC
+| Researcher | Contribution |
+|---|---|
+| ChendoChap & Znullptr | WebKit ROP execution, PS5 CFI analysis |
+| john-tornblom | ps5-payload-elfldr, ps5-payload-sdk |
+| SpecterDev | PS5-IPV6-Kernel-Exploit, PSFree |
+| sleirsgoevy | Original WebKit bug PoC |
+| idlesauce | umtx2 webkit jailbreak framework |
+| abc | PSFree 150b |
+| shahrilnet & n0llptr | umtx lua implementation |
 
 ---
 
-> **Legal notice:** This software is intended solely for security research on hardware you own.
-> Use for piracy or any other illegal activity is not permitted. See [LICENSE](LICENSE) (GPLv3).
+*Licensed GPLv3 · Research use only · PlayStation 5 is a trademark of Sony Interactive Entertainment*

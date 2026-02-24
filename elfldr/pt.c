@@ -1,293 +1,262 @@
 /**
- * pt.c — Bootstrap vía ptrace: inyecta el ELF loader en SceRedisServer
+ * pt.c — ptrace Bootstrap: Inject elfldr into SceRedisServer
  *
- * Técnica:
- *   1. Buscar el PID de SceRedisServer en /proc
- *   2. Adjuntarse al proceso con ptrace(PT_ATTACH)
- *   3. Copiar shellcode con ptrace(PT_WRITE_D) en una página RWX del target
- *   4. Redirigir RIP del target al shellcode
- *   5. El shellcode llama mmap() + memcpy() + instala el listener 9021
- *   6. Desadjuntarse (PT_DETACH): SceRedisServer continúa con el loader activo
+ * This module is executed as a payload by the initial ROP chain.
+ * It finds the SceRedisServer process, attaches via ptrace, injects
+ * a small shellcode stub that calls elfldr_main(), then detaches.
  *
- * Este enfoque permite que el loader persista incluso cuando el proceso
- * de WebKit es destruido (cambio de juego, recarga del browser, etc.).
+ * SceRedisServer is chosen because:
+ *   1. It runs persistently in the background
+ *   2. It survives browser restarts and rest mode
+ *   3. It has enough executable memory for injection
+ *   4. It does not perform integrity checks on its own code
+ *
+ * Architecture: FreeBSD AMD64 (Orbis OS)
+ * Requires: root + jail escape (done by kernel.js)
  */
 
+#include <sys/types.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/user.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include <errno.h>
 #include <unistd.h>
-#include <signal.h>
-#include <fcntl.h>
 #include <dirent.h>
-#include <sys/ptrace.h>
-#include <sys/wait.h>
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <sys/reg.h>      /* Para struct reg en FreeBSD */
+#include <fcntl.h>
 
 #include "pt.h"
+#include "elfldr.h"
 
-/* ── Definiciones FreeBSD/Orbis ─────────────────────────────────────────── */
-
-/* En FreeBSD, ptrace usa PT_* constantes */
-#ifndef PT_ATTACH
-#  define PT_ATTACH   10
-#  define PT_DETACH   11
-#  define PT_GETREGS  13
-#  define PT_SETREGS  14
-#  define PT_WRITE_D  5
-#  define PT_READ_D   2
-#  define PT_CONTINUE 7
-#endif
-
-/* ── Helpers de /proc ───────────────────────────────────────────────────── */
-
-/**
- * Busca el PID de un proceso por nombre leyendo /proc/<pid>/comm.
- * @param name  Nombre del proceso (parcial o completo)
- * @returns PID o -1 si no se encontró
- */
-static pid_t find_pid_by_name(const char *name) {
-    DIR *d = opendir("/proc");
-    if (!d) return -1;
-
-    struct dirent *ent;
-    pid_t result = -1;
-
-    while ((ent = readdir(d)) != NULL) {
-        /* Saltamos entradas que no son números */
-        char *endptr;
-        long pid = strtol(ent->d_name, &endptr, 10);
-        if (*endptr != '\0' || pid <= 0) continue;
-
-        /* Leer el nombre del proceso */
-        char comm_path[64];
-        snprintf(comm_path, sizeof(comm_path), "/proc/%ld/comm", pid);
-
-        int fd = open(comm_path, O_RDONLY);
-        if (fd < 0) continue;
-
-        char comm[256] = {0};
-        ssize_t n = read(fd, comm, sizeof(comm) - 1);
-        close(fd);
-
-        if (n <= 0) continue;
-        /* Quitar el newline final */
-        if (comm[n-1] == '\n') comm[n-1] = '\0';
-
-        if (strstr(comm, name) != NULL) {
-            result = (pid_t)pid;
-            break;
-        }
-    }
-
-    closedir(d);
-    return result;
-}
-
-/**
- * Lee la dirección de una región RWX del proceso target desde /proc/<pid>/maps.
- * Queremos un área donde podamos escribir shellcode.
- */
-static uintptr_t find_rwx_region(pid_t pid) {
-    char maps_path[64];
-    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int)pid);
-
-    FILE *f = fopen(maps_path, "r");
-    if (!f) return 0;
-
-    char line[256];
-    uintptr_t result = 0;
-
-    while (fgets(line, sizeof(line), f)) {
-        uintptr_t start, end;
-        char perms[8];
-
-        /* Formato: start-end perms offset dev inode [name] */
-        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
-
-        /* Buscar región rwxp */
-        if (perms[0] == 'r' && perms[1] == 'w' && perms[2] == 'x') {
-            if (end - start >= 0x1000) {   /* Al menos una página */
-                result = start;
-                break;
-            }
-        }
-    }
-
-    fclose(f);
-    return result;
-}
-
-/* ── Shellcode de bootstrap ─────────────────────────────────────────────── */
+/* ─── Shellcode ───────────────────────────────────────────────────────────── */
 
 /*
- * El shellcode que inyectamos en SceRedisServer hace lo mínimo necesario:
- *   1. Guardar todos los registros en el stack
- *   2. Llamar a la función que instala el listener del ELF loader
- *   3. Restaurar registros
- *   4. Retornar al RIP original (continúa SceRedisServer normalmente)
+ * The injected shellcode does two things:
+ *   1. Saves all registers (push rbp; mov rbp, rsp; pushall)
+ *   2. Calls our elfldr_main() function
+ *   3. Restores registers and jumps back to the original RIP
  *
- * El shellcode concreto depende de la ABI y los gadgets disponibles.
- * Aquí proporcionamos el esqueleto; el shellcode real se genera dinámicamente.
+ * Since we are hijacking an existing thread in SceRedisServer, we must
+ * restore its execution state precisely after our loader is set up.
+ *
+ * The actual elfldr_main() creates a new thread for the listener so that
+ * SceRedisServer's main thread can continue normally after we detach.
  */
 
-/* Plantilla de shellcode x86-64 para FreeBSD/Orbis */
-static const uint8_t SHELLCODE_TEMPLATE[] = {
-    /* pushfq                   — guardar flags                         */
-    0x9C,
-    /* push rax                                                          */
-    0x50,
-    /* push rbx                                                          */
-    0x53,
-    /* push rcx                                                          */
-    0x51,
-    /* push rdx                                                          */
-    0x52,
-    /* push rsi                                                          */
-    0x56,
-    /* push rdi                                                          */
-    0x57,
-    /* push r8                                                           */
-    0x41, 0x50,
-    /* push r9                                                           */
-    0x41, 0x51,
-    /* push r10                                                          */
-    0x41, 0x52,
-    /* push r11                                                          */
-    0x41, 0x53,
-
-    /* mov rax, STUB_ADDR       — dirección de la función del loader     */
-    /* [PATCH: 8 bytes en offset 14 = 0xE]                               */
-    0x48, 0xB8, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-    /* call rax                                                          */
-    0xFF, 0xD0,
-
-    /* pop r11 / r10 / r9 / r8 / rdi / rsi / rdx / rcx / rbx / rax     */
-    0x41, 0x5B,
-    0x41, 0x5A,
-    0x41, 0x59,
-    0x41, 0x58,
-    0x5F,
-    0x5E,
-    0x5A,
-    0x59,
-    0x5B,
-    0x58,
-    /* popfq                                                             */
-    0x9D,
-
-    /* mov rax, ORIG_RIP        — dirección de retorno original          */
-    /* [PATCH: 8 bytes en offset 40 = 0x28]                              */
-    0x48, 0xB8, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-    /* jmp rax                                                           */
-    0xFF, 0xE0,
+/* Placeholder shellcode — real implementation is architecture-specific */
+static const uint8_t INJECT_SHELLCODE[] = {
+    /* push rbp          */ 0x55,
+    /* mov rbp, rsp      */ 0x48, 0x89, 0xE5,
+    /* push rax          */ 0x50,
+    /* push rbx          */ 0x53,
+    /* push rcx          */ 0x51,
+    /* push rdx          */ 0x52,
+    /* push rsi          */ 0x56,
+    /* push rdi          */ 0x57,
+    /* push r8           */ 0x41, 0x50,
+    /* push r9           */ 0x41, 0x51,
+    /* push r10          */ 0x41, 0x52,
+    /* push r11          */ 0x41, 0x53,
+    /* movabs rax, addr  */ 0x48, 0xB8,
+      /* 8-byte address placeholder — patched at runtime */
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    /* call rax          */ 0xFF, 0xD0,
+    /* pop r11           */ 0x41, 0x5B,
+    /* pop r10           */ 0x41, 0x5A,
+    /* pop r9            */ 0x41, 0x59,
+    /* pop r8            */ 0x41, 0x58,
+    /* pop rdi           */ 0x5F,
+    /* pop rsi           */ 0x5E,
+    /* pop rdx           */ 0x5A,
+    /* pop rcx           */ 0x59,
+    /* pop rbx           */ 0x5B,
+    /* pop rax           */ 0x58,
+    /* pop rbp           */ 0x5D,
+    /* ret               */ 0xC3,
 };
 
-#define SHELLCODE_STUB_OFFSET   14   /* Offset donde parchear la dirección del stub */
-#define SHELLCODE_ORIG_OFFSET   40   /* Offset donde parchear el RIP original */
-#define SHELLCODE_SIZE          sizeof(SHELLCODE_TEMPLATE)
+/* Offset of the 8-byte address placeholder within INJECT_SHELLCODE */
+#define SHELLCODE_ADDR_OFFSET  18
 
-/* ── Implementación principal ───────────────────────────────────────────── */
+/* ─── Process utilities ──────────────────────────────────────────────────── */
 
 /**
- * Inyecta el ELF loader en SceRedisServer vía ptrace.
+ * Find the PID of SceRedisServer by scanning /proc.
+ * On Orbis OS, /proc/<pid>/cmdline contains the process name.
  *
- * @param target_name  Nombre del proceso destino
- * @returns 0 si OK, -1 si error
+ * @returns PID on success, -1 if not found.
  */
-int pt_bootstrap(const char *target_name) {
-    /* 1. Encontrar el PID del proceso destino */
-    pid_t target_pid = find_pid_by_name(target_name);
-    if (target_pid < 0) {
-        return -1;  /* Proceso no encontrado */
-    }
+static pid_t find_redis_pid(void) {
+    DIR *dp = opendir("/proc");
+    if (!dp) return -1;
 
-    /* 2. Adjuntarse al proceso */
-    if (ptrace(PT_ATTACH, target_pid, NULL, 0) < 0) {
-        return -1;
-    }
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        /* Only look at numeric entries (PIDs) */
+        pid_t pid = 0;
+        for (int i = 0; de->d_name[i]; i++) {
+            char c = de->d_name[i];
+            if (c < '0' || c > '9') { pid = 0; break; }
+            pid = pid * 10 + (c - '0');
+        }
+        if (!pid) continue;
 
-    /* Esperar a que el proceso se detenga */
-    int status;
-    if (waitpid(target_pid, &status, 0) < 0) {
-        ptrace(PT_DETACH, target_pid, NULL, 0);
-        return -1;
-    }
+        /* Read /proc/<pid>/cmdline */
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
 
-    if (!WIFSTOPPED(status)) {
-        ptrace(PT_DETACH, target_pid, NULL, 0);
-        return -1;
-    }
+        char cmdline[256] = {0};
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        read(fd, cmdline, sizeof(cmdline) - 1);
+        close(fd);
 
-    /* 3. Leer los registros actuales */
-    struct reg regs;
-    if (ptrace(PT_GETREGS, target_pid, &regs, 0) < 0) {
-        ptrace(PT_DETACH, target_pid, NULL, 0);
-        return -1;
-    }
-
-    uintptr_t orig_rip = (uintptr_t)regs.r_rip;
-
-    /* 4. Encontrar una región RWX donde inyectar el shellcode */
-    uintptr_t rwx_addr = find_rwx_region(target_pid);
-    if (rwx_addr == 0) {
-        /* No hay región RWX; crear una con ptrace + mmap syscall */
-        /* Esto requiere un stub ROP adicional — simplificado aquí */
-        ptrace(PT_DETACH, target_pid, NULL, 0);
-        return -1;
-    }
-
-    /* 5. Preparar el shellcode */
-    uint8_t shellcode[SHELLCODE_SIZE];
-    memcpy(shellcode, SHELLCODE_TEMPLATE, SHELLCODE_SIZE);
-
-    /* Parchar la dirección del stub del loader (instalador del listener) */
-    /* En el contexto real, esta es la dirección de la función que
-     * instala el socket server dentro de SceRedisServer */
-    uintptr_t stub_addr = 0; /* TODO: se pasa como argumento en la implementación real */
-    memcpy(shellcode + SHELLCODE_STUB_OFFSET, &stub_addr, sizeof(uintptr_t));
-
-    /* Parchar el RIP original para retornar correctamente */
-    memcpy(shellcode + SHELLCODE_ORIG_OFFSET, &orig_rip, sizeof(uintptr_t));
-
-    /* 6. Escribir el shellcode en el proceso destino */
-    size_t words = (SHELLCODE_SIZE + sizeof(long) - 1) / sizeof(long);
-    for (size_t i = 0; i < words; i++) {
-        long word;
-        memcpy(&word, shellcode + i * sizeof(long),
-               sizeof(long) > SHELLCODE_SIZE - i * sizeof(long)
-               ? SHELLCODE_SIZE - i * sizeof(long)
-               : sizeof(long));
-
-        if (ptrace(PT_WRITE_D, target_pid,
-                   (void *)(rwx_addr + i * sizeof(long)), word) < 0) {
-            ptrace(PT_DETACH, target_pid, NULL, 0);
-            return -1;
+        if (strstr(cmdline, "SceRedisServer") != NULL) {
+            closedir(dp);
+            return pid;
         }
     }
 
-    /* 7. Redirigir RIP al shellcode */
-    regs.r_rip = (register_t)rwx_addr;
-    if (ptrace(PT_SETREGS, target_pid, &regs, 0) < 0) {
-        ptrace(PT_DETACH, target_pid, NULL, 0);
-        return -1;
+    closedir(dp);
+    return -1;
+}
+
+/* ─── ptrace helpers ─────────────────────────────────────────────────────── */
+
+/**
+ * Read `len` bytes from the target process at virtual address `addr`.
+ * Uses PTRACE_PEEKDATA (reads one word at a time).
+ *
+ * @param pid    Target process PID.
+ * @param addr   Virtual address in target.
+ * @param buf    Output buffer.
+ * @param len    Number of bytes to read.
+ * @returns 0 on success, -1 on error.
+ */
+static int ptrace_read(pid_t pid, uintptr_t addr, uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < len; i += sizeof(long)) {
+        long word = ptrace(PT_READ_D, pid, (caddr_t)(addr + i), 0);
+        size_t copy = (len - i < sizeof(long)) ? (len - i) : sizeof(long);
+        memcpy(buf + i, &word, copy);
     }
-
-    /* 8. Continuar la ejecución del proceso */
-    if (ptrace(PT_CONTINUE, target_pid, (void *)1, 0) < 0) {
-        ptrace(PT_DETACH, target_pid, NULL, 0);
-        return -1;
-    }
-
-    /* 9. Esperar a que el shellcode se ejecute y el proceso continúe */
-    /* En la práctica, esperamos una señal o un tiempo fijo */
-    usleep(500000);  /* 500ms */
-
-    /* 10. Desadjuntarse */
-    ptrace(PT_DETACH, target_pid, (void *)1, 0);
-
     return 0;
+}
+
+/**
+ * Write `len` bytes to the target process at virtual address `addr`.
+ * Uses PTRACE_POKEDATA (writes one word at a time).
+ */
+static int ptrace_write(pid_t pid, uintptr_t addr, const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < len; i += sizeof(long)) {
+        long word = 0;
+        size_t copy = (len - i < sizeof(long)) ? (len - i) : sizeof(long);
+
+        /* For partial words, read-modify-write to preserve surrounding bytes */
+        if (copy < sizeof(long)) {
+            word = ptrace(PT_READ_D, pid, (caddr_t)(addr + i), 0);
+        }
+
+        memcpy(&word, buf + i, copy);
+        ptrace(PT_WRITE_D, pid, (caddr_t)(addr + i), word);
+    }
+    return 0;
+}
+
+/* ─── Main injection routine ─────────────────────────────────────────────── */
+
+/**
+ * pt_inject() — Attach to SceRedisServer and inject the ELF loader.
+ *
+ * Steps:
+ *   1. Find SceRedisServer PID
+ *   2. ptrace attach + SIGSTOP
+ *   3. Save registers (getregs)
+ *   4. Patch shellcode with elfldr_main address
+ *   5. Write shellcode to an executable region in target
+ *   6. Redirect RIP to shellcode
+ *   7. PTRACE_CONT — shellcode runs, sets up listener thread
+ *   8. SIGSTOP again, restore original registers
+ *   9. PTRACE_CONT — SceRedisServer continues normally
+ *  10. ptrace detach
+ *
+ * @param elfldr_main_addr   Virtual address of elfldr_main() in OUR process.
+ *                           Since we are running as a payload inside a fork()
+ *                           of SceRedisServer (after the initial loader ELF
+ *                           is executed), our address space already contains
+ *                           elfldr_main — but in the injected context, this
+ *                           address must be valid in the TARGET process too.
+ *
+ * @returns 0 on success.
+ */
+int pt_inject(uintptr_t elfldr_main_addr) {
+    /* 1. Find SceRedisServer */
+    pid_t target = find_redis_pid();
+    if (target < 0) {
+        return PT_ERR_PROC_NOT_FOUND;
+    }
+
+    /* 2. Attach */
+    if (ptrace(PT_ATTACH, target, 0, 0) < 0) {
+        return PT_ERR_ATTACH_FAILED;
+    }
+
+    /* Wait for SIGSTOP */
+    int status;
+    waitpid(target, &status, 0);
+    if (!WIFSTOPPED(status)) {
+        ptrace(PT_DETACH, target, (caddr_t)1, 0);
+        return PT_ERR_ATTACH_FAILED;
+    }
+
+    /* 3. Save registers */
+    struct reg saved_regs;
+    if (ptrace(PT_GETREGS, target, (caddr_t)&saved_regs, 0) < 0) {
+        ptrace(PT_DETACH, target, (caddr_t)1, 0);
+        return PT_ERR_GETREGS_FAILED;
+    }
+
+    /* 4. Patch shellcode: write elfldr_main_addr at the placeholder offset */
+    uint8_t shellcode[sizeof(INJECT_SHELLCODE)];
+    memcpy(shellcode, INJECT_SHELLCODE, sizeof(shellcode));
+    memcpy(shellcode + SHELLCODE_ADDR_OFFSET, &elfldr_main_addr, 8);
+
+    /* 5. Write shellcode into the target's stack (just below RSP — safe for
+     *    a stopped process; we restore everything before continuing) */
+    uintptr_t inject_addr = (uintptr_t)saved_regs.r_rsp - sizeof(shellcode) - 0x100;
+    /* Align to 16 bytes */
+    inject_addr &= ~0xFULL;
+
+    /* Save original bytes at injection site */
+    uint8_t orig_bytes[sizeof(shellcode)];
+    ptrace_read(target, inject_addr, orig_bytes, sizeof(orig_bytes));
+
+    ptrace_write(target, inject_addr, shellcode, sizeof(shellcode));
+
+    /* 6. Redirect RIP */
+    struct reg new_regs = saved_regs;
+    new_regs.r_rip = inject_addr;
+    ptrace(PT_SETREGS, target, (caddr_t)&new_regs, 0);
+
+    /* 7. Continue — shellcode runs and sets up the listener thread */
+    ptrace(PT_CONTINUE, target, (caddr_t)1, 0);
+
+    /* Wait a moment for the thread to start (simple spin — no SAB/Atomics) */
+    /* In practice, a short sleep is sufficient */
+    volatile int spin = 1000000;
+    while (spin-- > 0) { /* busy wait */ }
+
+    /* 8. Stop again and restore registers + original bytes */
+    kill(target, SIGSTOP);
+    waitpid(target, &status, 0);
+
+    ptrace_write(target, inject_addr, orig_bytes, sizeof(orig_bytes));
+    ptrace(PT_SETREGS, target, (caddr_t)&saved_regs, 0);
+
+    /* 9 & 10. Continue and detach */
+    ptrace(PT_CONTINUE, target, (caddr_t)1, 0);
+    ptrace(PT_DETACH,   target, (caddr_t)1, 0);
+
+    return PT_OK;
 }
