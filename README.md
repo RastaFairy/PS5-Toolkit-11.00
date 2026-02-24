@@ -259,6 +259,17 @@ cp elfldr/elfldr.elf payloads/
 
 ---
 
+## Todo
+
+Only two things remain that require the binaries and cannot be done any other way:
+
+1. Verify the offsets marked with `⚠ VERIFY` — run `gen_offsets.py` once you have the `.elf` files
+2. `prison0` offset in `kernel.js` — extracted automatically by `analyze_kernel.py`
+
+Everything else is implemented and connected. Once you have the dumps, a single command generates the final `offsets_1100.js`.
+
+---
+
 ## Contributing
 
 Contributions are welcome. Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before submitting a pull request.
