@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PS5-Toolkit — Project Status</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0c0c10;
+    --surface:   #13131a;
+    --border:    #1e1e2e;
+    --border2:   #2a2a3e;
+    --text:      #c8c8d8;
+    --muted:     #4a4a6a;
+    --accent:    #5b7cff;
+    --accent2:   #8b5cf6;
+    --ok:        #22c55e;
+    --warn:      #f59e0b;
+    --err:       #ef4444;
+    --todo:      #f97316;
+    --mono:      'Space Mono', monospace;
+    --sans:      'DM Sans', sans-serif;
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.65;
+    min-height: 100vh;
+  }
+
+  /* ── Noise overlay ── */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.5;
+  }
+
+  .wrap {
+    position: relative;
+    z-index: 1;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+
+  /* ── Header ── */
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 36px;
+    flex-wrap: wrap;
+  }
+
+  .header-left { flex: 1; min-width: 200px; }
+
+  .badge-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+
+  .badge {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 3px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    border: 1px solid;
+  }
+  .badge-fw   { color: #60a5fa; border-color: #1e3a5f; background: #0d1f35; }
+  .badge-arch { color: #a78bfa; border-color: #3b2f6e; background: #1a1232; }
+  .badge-st   { color: var(--todo); border-color: #5c2e0a; background: #2a1405; }
+
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(20px, 4vw, 28px);
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+    line-height: 1.2;
+  }
+  h1 span { color: var(--accent); }
+
+  .subtitle {
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 6px;
+  }
+
+  /* ── Lang toggle ── */
+  .lang-toggle {
+    display: flex;
+    border: 1px solid var(--border2);
+    border-radius: 6px;
+    overflow: hidden;
+    flex-shrink: 0;
+    align-self: flex-start;
+    margin-top: 4px;
+  }
+  .lang-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 7px 16px;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 1px;
+  }
+  .lang-btn.active {
+    background: var(--accent);
+    color: #fff;
+  }
+  .lang-btn:hover:not(.active) { color: var(--text); background: var(--border); }
+
+  /* ── Mode tabs ── */
+  .mode-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 32px;
+  }
+  .mode-tab {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--muted);
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 500;
+    padding: 10px 20px 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    margin-bottom: -1px;
+  }
+  .mode-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .mode-tab:hover:not(.active) { color: var(--text); }
+
+  /* ── Panels ── */
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* ── Warning banner ── */
+  .warning-banner {
+    border: 1px solid #5c2e0a;
+    background: linear-gradient(135deg, #1a0c04 0%, #130a02 100%);
+    border-radius: 8px;
+    padding: 18px 20px;
+    margin-bottom: 28px;
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+  }
+  .warning-icon {
+    font-size: 20px;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .warning-text { flex: 1; }
+  .warning-title {
+    font-weight: 600;
+    color: var(--todo);
+    font-size: 14px;
+    margin-bottom: 4px;
+  }
+  .warning-body {
+    color: #c08050;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .warning-body strong { color: var(--todo); }
+
+  /* ── Section titles ── */
+  .section-title {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* ── Status table ── */
+  .status-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-bottom: 32px;
+  }
+  .status-row {
+    display: grid;
+    grid-template-columns: 1fr 80px 1fr;
+    gap: 12px;
+    align-items: center;
+    padding: 9px 14px;
+    border-radius: 5px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    transition: border-color 0.15s;
+    font-size: 13px;
+  }
+  .status-row:hover { border-color: var(--border2); }
+  .status-row .component { font-family: var(--mono); font-size: 12px; color: #a0a8d0; }
+  .status-row .blocker { color: var(--muted); font-size: 12px; }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-family: var(--mono);
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+  }
+  .pill-ok   { background: #0d2b1a; color: var(--ok);   border: 1px solid #144d2a; }
+  .pill-err  { background: #2b0d0d; color: var(--err);  border: 1px solid #5c1a1a; }
+  .pill-warn { background: #2b1e0d; color: var(--warn); border: 1px solid #5c3e1a; }
+
+  /* ── Key insight boxes ── */
+  .insights { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; margin-bottom: 32px; }
+  .insight {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    position: relative;
+    overflow: hidden;
+  }
+  .insight::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+  }
+  .insight.bad::before   { background: var(--err); }
+  .insight.warn::before  { background: var(--warn); }
+  .insight.good::before  { background: var(--ok); }
+  .insight-icon { font-size: 22px; margin-bottom: 8px; }
+  .insight-title { font-weight: 600; font-size: 13px; color: #fff; margin-bottom: 5px; }
+  .insight-body { font-size: 12px; color: var(--muted); line-height: 1.6; }
+
+  /* ── Code block ── */
+  .code-block {
+    background: #090910;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px 18px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.8;
+    color: #8890b8;
+    margin-bottom: 20px;
+    overflow-x: auto;
+  }
+  .code-block .cm { color: #3d4060; }
+  .code-block .kw { color: #5b7cff; }
+  .code-block .st { color: #22c55e; }
+  .code-block .er { color: #ef4444; }
+  .code-block .ok { color: #22c55e; }
+  .code-block .wa { color: #f59e0b; }
+
+  /* ── Broken pieces (technical) ── */
+  .broken-list { display: flex; flex-direction: column; gap: 16px; margin-bottom: 32px; }
+  .broken-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--err);
+    border-radius: 0 8px 8px 0;
+    padding: 16px 18px;
+  }
+  .broken-item.warn-item { border-left-color: var(--warn); }
+  .broken-title { font-family: var(--mono); font-size: 13px; color: #fff; margin-bottom: 6px; font-weight: 700; }
+  .broken-body { font-size: 13px; color: var(--muted); line-height: 1.7; }
+  .broken-body code {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: #0c0c18;
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #7080c0;
+  }
+
+  /* ── Root cause callout ── */
+  .root-cause {
+    background: #0d0d1f;
+    border: 1px solid #2a2a5a;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 32px;
+    text-align: center;
+  }
+  .root-cause-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+  .root-cause-main {
+    font-family: var(--mono);
+    font-size: clamp(13px, 2vw, 16px);
+    color: var(--accent);
+    line-height: 1.5;
+  }
+  .root-cause-sub { font-size: 13px; color: var(--muted); margin-top: 8px; }
+
+  /* ── Plain language cards ── */
+  .plain-cards { display: flex; flex-direction: column; gap: 16px; margin-bottom: 32px; }
+  .plain-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+  }
+  .plain-card-icon { font-size: 28px; flex-shrink: 0; }
+  .plain-card-title { font-weight: 600; font-size: 15px; color: #fff; margin-bottom: 6px; }
+  .plain-card-body { font-size: 13px; color: var(--muted); line-height: 1.7; }
+  .plain-card-body strong { color: var(--text); }
+
+  /* ── Path forward ── */
+  .steps { display: flex; flex-direction: column; gap: 0; margin-bottom: 32px; }
+  .step {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--border);
+    position: relative;
+  }
+  .step:last-child { border-bottom: none; }
+  .step-num {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: var(--border2);
+    border: 1px solid var(--border2);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  .step-title { font-weight: 500; color: var(--text); font-size: 14px; margin-bottom: 3px; }
+  .step-body { font-size: 12px; color: var(--muted); }
+
+  /* ── Chain overview ── */
+  .chain { display: flex; flex-direction: column; gap: 2px; margin-bottom: 32px; }
+  .chain-step {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 10px 14px;
+    border-radius: 5px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .chain-num {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    width: 20px;
+    flex-shrink: 0;
+  }
+  .chain-label { flex: 1; color: var(--text); }
+  .chain-label span { color: var(--muted); font-size: 12px; display: block; }
+  .chain-arrow { color: var(--border2); font-size: 16px; }
+
+  /* ── Footer note ── */
+  .footer-note {
+    text-align: center;
+    font-size: 12px;
+    color: var(--muted);
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    line-height: 1.8;
+  }
+  .footer-note a { color: var(--accent); text-decoration: none; }
+  .footer-note a:hover { text-decoration: underline; }
+
+  /* ── Lang content ── */
+  [data-lang] { display: none; }
+  [data-lang].visible { display: block; }
+  [data-lang-inline] { display: none; }
+  [data-lang-inline].visible { display: inline; }
+
+  /* ── Responsive ── */
+  @media (max-width: 600px) {
+    .status-row { grid-template-columns: 1fr 70px; }
+    .status-row .blocker { display: none; }
+    .insights { grid-template-columns: 1fr; }
+  }
+
+  /* ── Animations ── */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .panel.active { animation: fadeUp 0.25s ease; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="badge-row">
+        <span class="badge badge-fw">FW 11.xx</span>
+        <span class="badge badge-arch">FreeBSD AMD64</span>
+        <span class="badge badge-st">Research Scaffold</span>
+      </div>
+      <h1>PS5-<span>Toolkit</span></h1>
+      <p class="subtitle">WebKit / JavaScriptCore · ROP-only · Not a working exploit</p>
+    </div>
+    <div class="lang-toggle">
+      <button class="lang-btn active" onclick="setLang('en')">EN</button>
+      <button class="lang-btn" onclick="setLang('es')">ES</button>
+    </div>
+  </div>
+
+  <!-- Mode tabs -->
+  <div class="mode-tabs">
+    <button class="mode-tab active" onclick="setMode('plain')">
+      <data-lang-inline data-lang="en" class="visible">General Overview</data-lang-inline>
+      <data-lang-inline data-lang="es">Visión General</data-lang-inline>
+    </button>
+    <button class="mode-tab" onclick="setMode('tech')">
+      <data-lang-inline data-lang="en" class="visible">Technical Detail</data-lang-inline>
+      <data-lang-inline data-lang="es">Detalle Técnico</data-lang-inline>
+    </button>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════════
+       PLAIN PANEL
+  ══════════════════════════════════════════════════════════════════ -->
+  <div class="panel active" id="panel-plain">
+
+    <!-- Warning -->
+    <div class="warning-banner">
+      <div class="warning-icon">⚠️</div>
+      <div class="warning-text">
+        <div class="warning-title" data-lang="en" class="visible">This is not a working exploit</div>
+        <div class="warning-title" data-lang="es">Esto no es un exploit funcional</div>
+        <div class="warning-body" data-lang="en" class="visible">
+          This project documents how a PS5 exploit chain <em>would</em> work. Several circulating projects present code like this as ready-to-use. They are not.
+          <strong>If there is no video of it running on real hardware, it does not work.</strong>
+        </div>
+        <div class="warning-body" data-lang="es">
+          Este proyecto documenta cómo <em>funcionaría</em> una cadena de explotación para PS5. Varios proyectos en circulación presentan código como este como si estuviera listo para usar. No lo están.
+          <strong>Si no hay un vídeo ejecutándose en hardware real, no funciona.</strong>
+        </div>
+      </div>
+    </div>
+
+    <!-- Key concepts -->
+    <div class="section-title" data-lang="en" class="visible">Key concepts</div>
+    <div class="section-title" data-lang="es">Conceptos clave</div>
+
+    <div class="plain-cards">
+
+      <div class="plain-card">
+        <div class="plain-card-icon">🧩</div>
+        <div>
+          <div class="plain-card-title" data-lang="en" class="visible">What is this project?</div>
+          <div class="plain-card-title" data-lang="es">¿Qué es este proyecto?</div>
+          <div class="plain-card-body" data-lang="en" class="visible">
+            A fully documented blueprint of a PS5 browser exploit. Think of it like architectural blueprints for a building — every room is planned, the structure is correct, but <strong>two critical pages are intentionally blank</strong> because they require hardware analysis nobody on this project has done yet.
+          </div>
+          <div class="plain-card-body" data-lang="es">
+            Un plano completamente documentado de un exploit del navegador de PS5. Como los planos de un edificio — cada habitación está planificada, la estructura es correcta, pero <strong>dos páginas críticas están en blanco</strong> porque requieren un análisis de hardware que nadie en este proyecto ha realizado todavía.
+          </div>
+        </div>
+      </div>
+
+      <div class="plain-card">
+        <div class="plain-card-icon">🚫</div>
+        <div>
+          <div class="plain-card-title" data-lang="en" class="visible">No JIT compiler on PS5</div>
+          <div class="plain-card-title" data-lang="es">Sin compilador JIT en PS5</div>
+          <div class="plain-card-body" data-lang="en" class="visible">
+            Many circulating "PS5 exploits" claim to attack the JIT compiler. The PS5 browser has <strong>JIT disabled entirely</strong>. There is no JIT process to attack. Any project claiming "DFG JIT type confusion" for PS5 is technically impossible by definition.
+          </div>
+          <div class="plain-card-body" data-lang="es">
+            Muchos "exploits de PS5" en circulación afirman atacar el compilador JIT. El navegador de PS5 tiene el <strong>JIT completamente deshabilitado</strong>. No hay proceso JIT al que atacar. Cualquier proyecto que afirme "DFG JIT type confusion" para PS5 es técnicamente imposible por definición.
+          </div>
+        </div>
+      </div>
+
+      <div class="plain-card">
+        <div class="plain-card-icon">🔗</div>
+        <div>
+          <div class="plain-card-title" data-lang="en" class="visible">Code execution via ROP only</div>
+          <div class="plain-card-title" data-lang="es">Ejecución de código solo por ROP</div>
+          <div class="plain-card-body" data-lang="en" class="visible">
+            Instead of injecting new code, ROP (Return-Oriented Programming) chains together tiny snippets of code that already exist in the console's memory. Like building sentences from words cut out of existing books. <strong>This is the only viable method on PS5</strong> — and it requires knowing the exact memory addresses of those snippets, which vary per firmware version.
+          </div>
+          <div class="plain-card-body" data-lang="es">
+            En lugar de inyectar código nuevo, ROP (Programación Orientada a Retornos) encadena pequeños fragmentos de código que ya existen en la memoria de la consola. Como construir frases con palabras recortadas de libros existentes. <strong>Este es el único método viable en PS5</strong> — y requiere conocer las direcciones exactas de esos fragmentos, que varían por versión de firmware.
+          </div>
+        </div>
+      </div>
+
+      <div class="plain-card">
+        <div class="plain-card-icon">🔑</div>
+        <div>
+          <div class="plain-card-title" data-lang="en" class="visible">The single missing key</div>
+          <div class="plain-card-title" data-lang="es">La única pieza que falta</div>
+          <div class="plain-card-body" data-lang="en" class="visible">
+            Everything in this project stops at the same wall: a file called <code>offsets_1100.js</code> where every critical memory address is set to zero. Finding real values requires extracting and reverse-engineering the actual PS5 firmware 11.00 binaries — something that needs existing hardware access and specialized tools.
+          </div>
+          <div class="plain-card-body" data-lang="es">
+            Todo en este proyecto se detiene en la misma pared: un archivo llamado <code>offsets_1100.js</code> donde cada dirección de memoria crítica está a cero. Encontrar los valores reales requiere extraer e invertir la ingeniería de los binarios reales del firmware PS5 11.00 — algo que necesita acceso a hardware existente y herramientas especializadas.
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- What works / What doesn't -->
+    <div class="section-title" data-lang="en" class="visible">What works vs. what doesn't</div>
+    <div class="section-title" data-lang="es">Qué funciona y qué no</div>
+
+    <div class="insights">
+      <div class="insight good">
+        <div class="insight-icon">✅</div>
+        <div class="insight-title" data-lang="en" class="visible">Works fine</div>
+        <div class="insight-title" data-lang="es">Funciona bien</div>
+        <div class="insight-body" data-lang="en" class="visible">ELF binary loader, host tools, server, log receiver, 64-bit math helpers, ROP chain builder logic, kernel escalation logic</div>
+        <div class="insight-body" data-lang="es">Cargador de binarios ELF, herramientas de host, servidor, receptor de logs, helpers matemáticos de 64 bits, lógica del constructor ROP, lógica de escalada al kernel</div>
+      </div>
+      <div class="insight bad">
+        <div class="insight-icon">❌</div>
+        <div class="insight-title" data-lang="en" class="visible">Does not work</div>
+        <div class="insight-title" data-lang="es">No funciona</div>
+        <div class="insight-body" data-lang="en" class="visible">The initial exploit trigger, libkernel address leak, all ROP gadget addresses, kernel pipe R/W primitive, memory allocation via ROP</div>
+        <div class="insight-body" data-lang="es">El disparador del exploit inicial, el leak de dirección de libkernel, todas las direcciones de gadgets ROP, la primitiva R/W del kernel por pipe, la asignación de memoria vía ROP</div>
+      </div>
+      <div class="insight warn">
+        <div class="insight-icon">⚠️</div>
+        <div class="insight-title" data-lang="en" class="visible">Unreliable</div>
+        <div class="insight-title" data-lang="es">No fiable</div>
+        <div class="insight-body" data-lang="en" class="visible">The ptrace injection timing in pt.c uses a busy-wait loop that can trigger the OS watchdog and kill the target process</div>
+        <div class="insight-body" data-lang="es">El timing de la inyección ptrace en pt.c usa un bucle de espera activa que puede activar el watchdog del SO y matar el proceso objetivo</div>
+      </div>
+    </div>
+
+    <!-- Path to completion -->
+    <div class="section-title" data-lang="en" class="visible">What would make this complete</div>
+    <div class="section-title" data-lang="es">Qué haría esto completo</div>
+
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div>
+          <div class="step-title" data-lang="en" class="visible">A PS5 on FW 11.00 (do not update)</div>
+          <div class="step-title" data-lang="es">Una PS5 en FW 11.00 (no actualizar)</div>
+          <div class="step-body" data-lang="en" class="visible">Required to dump the firmware binaries</div>
+          <div class="step-body" data-lang="es">Necesario para volcar los binarios del firmware</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div>
+          <div class="step-title" data-lang="en" class="visible">A working exploit for an older firmware</div>
+          <div class="step-title" data-lang="es">Un exploit funcional para un firmware anterior</div>
+          <div class="step-body" data-lang="en" class="visible">Needed to extract the binaries from the running console (SpecterDev's tools for older FW)</div>
+          <div class="step-body" data-lang="es">Necesario para extraer los binarios de la consola en ejecución (herramientas de SpecterDev para FW anterior)</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div>
+          <div class="step-title" data-lang="en" class="visible">Ghidra analysis of WebKit and libkernel binaries</div>
+          <div class="step-title" data-lang="es">Análisis con Ghidra de los binarios WebKit y libkernel</div>
+          <div class="step-body" data-lang="en" class="visible">Find the type confusion bug, GOT pointers, gadget offsets, and kernel struct layouts</div>
+          <div class="step-body" data-lang="es">Encontrar el bug de type confusion, punteros GOT, offsets de gadgets, y layouts de structs del kernel</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <div>
+          <div class="step-title" data-lang="en" class="visible">Fill in offsets_1100.js with verified values</div>
+          <div class="step-title" data-lang="es">Rellenar offsets_1100.js con valores verificados</div>
+          <div class="step-body" data-lang="en" class="visible">This single file is the only barrier between this scaffold and a working exploit</div>
+          <div class="step-body" data-lang="es">Este único archivo es la única barrera entre este scaffold y un exploit funcional</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">5</div>
+        <div>
+          <div class="step-title" data-lang="en" class="visible">Iterative testing on hardware</div>
+          <div class="step-title" data-lang="es">Pruebas iterativas en hardware</div>
+          <div class="step-body" data-lang="en" class="visible">Each stage of the chain needs validation on a real FW 11.00 device</div>
+          <div class="step-body" data-lang="es">Cada etapa de la cadena necesita validación en un dispositivo real con FW 11.00</div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /panel-plain -->
+
+  <!-- ══════════════════════════════════════════════════════════════════
+       TECHNICAL PANEL
+  ══════════════════════════════════════════════════════════════════ -->
+  <div class="panel" id="panel-tech">
+
+    <!-- Warning -->
+    <div class="warning-banner">
+      <div class="warning-icon">⚠️</div>
+      <div class="warning-text">
+        <div class="warning-title" data-lang="en" class="visible">Not a working exploit — all critical offsets are 0x0</div>
+        <div class="warning-title" data-lang="es">No es un exploit funcional — todos los offsets críticos son 0x0</div>
+        <div class="warning-body" data-lang="en" class="visible">
+          The root cause of every broken component is the same: <strong>offsets_1100.js contains no verified values</strong>. A zero offset computes <code>libkernelBase + 0x0</code>, pointing at the binary header, not a gadget. Everything fails silently or crashes.
+        </div>
+        <div class="warning-body" data-lang="es">
+          La causa raíz de cada componente roto es la misma: <strong>offsets_1100.js no contiene valores verificados</strong>. Un offset a cero calcula <code>libkernelBase + 0x0</code>, apuntando a la cabecera del binario, no a un gadget. Todo falla silenciosamente o crashea.
+        </div>
+      </div>
+    </div>
+
+    <!-- Root cause callout -->
+    <div class="root-cause">
+      <div class="root-cause-label" data-lang="en" class="visible">Single root cause</div>
+      <div class="root-cause-label" data-lang="es">Causa raíz única</div>
+      <div class="root-cause-main">offsets_1100.js — every critical value = 0x00000000</div>
+      <div class="root-cause-sub" data-lang="en" class="visible">Requires: decrypted FW 11.00 dump → Ghidra analysis → ROPgadget scan</div>
+      <div class="root-cause-sub" data-lang="es">Requiere: dump de FW 11.00 desencriptado → análisis en Ghidra → escaneo con ROPgadget</div>
+    </div>
+
+    <!-- Status table -->
+    <div class="section-title" data-lang="en" class="visible">Component status</div>
+    <div class="section-title" data-lang="es">Estado de componentes</div>
+
+    <div class="status-grid">
+      <div class="status-row">
+        <div class="component">triggerWebKitBug()</div>
+        <div><span class="pill pill-err">❌ TODO</span></div>
+        <div class="blocker" data-lang="en" class="visible">JSC type confusion in FW 11.00 WebKit binary</div>
+        <div class="blocker" data-lang="es">Type confusion JSC en binario WebKit FW 11.00</div>
+      </div>
+      <div class="status-row">
+        <div class="component">leakLibKernelBase()</div>
+        <div><span class="pill pill-err">❌ TODO</span></div>
+        <div class="blocker" data-lang="en" class="visible">GOT pointer in WebKit → libkernel</div>
+        <div class="blocker" data-lang="es">Puntero GOT en WebKit → libkernel</div>
+      </div>
+      <div class="status-row">
+        <div class="component">GADGET_* offsets</div>
+        <div><span class="pill pill-err">❌ 0x0</span></div>
+        <div class="blocker" data-lang="en" class="visible">ROPgadget on libkernel_web.sprx</div>
+        <div class="blocker" data-lang="es">ROPgadget sobre libkernel_web.sprx</div>
+      </div>
+      <div class="status-row">
+        <div class="component">_pipeRead8/Write8</div>
+        <div><span class="pill pill-err">❌ Empty</span></div>
+        <div class="blocker" data-lang="en" class="visible">pipe_buffer layout from kernel binary</div>
+        <div class="blocker" data-lang="es">Layout de pipe_buffer del binario del kernel</div>
+      </div>
+      <div class="status-row">
+        <div class="component">_ropMmap()</div>
+        <div><span class="pill pill-err">❌ ret 0x0</span></div>
+        <div class="blocker" data-lang="en" class="visible">mov [mem], rax gadget offset missing</div>
+        <div class="blocker" data-lang="es">Offset del gadget mov [mem], rax ausente</div>
+      </div>
+      <div class="status-row">
+        <div class="component">pt.c spin-wait</div>
+        <div><span class="pill pill-warn">⚠️ Risk</span></div>
+        <div class="blocker" data-lang="en" class="visible">nanosleep/sched_yield offsets needed</div>
+        <div class="blocker" data-lang="es">Offsets de nanosleep/sched_yield necesarios</div>
+      </div>
+      <div class="status-row">
+        <div class="component">elfldr.c ELF parser</div>
+        <div><span class="pill pill-ok">✅ Real</span></div>
+        <div class="blocker" data-lang="en" class="visible">No firmware dependency</div>
+        <div class="blocker" data-lang="es">Sin dependencia de firmware</div>
+      </div>
+      <div class="status-row">
+        <div class="component">int64.js</div>
+        <div><span class="pill pill-ok">✅ Real</span></div>
+        <div class="blocker" data-lang="en" class="visible">No firmware dependency</div>
+        <div class="blocker" data-lang="es">Sin dependencia de firmware</div>
+      </div>
+      <div class="status-row">
+        <div class="component">ROPChain builder</div>
+        <div><span class="pill pill-ok">✅ Real</span></div>
+        <div class="blocker" data-lang="en" class="visible">Logic correct — blocked by missing offsets</div>
+        <div class="blocker" data-lang="es">Lógica correcta — bloqueado por offsets ausentes</div>
+      </div>
+      <div class="status-row">
+        <div class="component">Host tools</div>
+        <div><span class="pill pill-ok">✅ Real</span></div>
+        <div class="blocker" data-lang="en" class="visible">server.py, send_payload.py, listen_log.py</div>
+        <div class="blocker" data-lang="es">server.py, send_payload.py, listen_log.py</div>
+      </div>
+    </div>
+
+    <!-- Broken pieces detail -->
+    <div class="section-title" data-lang="en" class="visible">Broken pieces — detail</div>
+    <div class="section-title" data-lang="es">Piezas rotas — detalle</div>
+
+    <div class="broken-list">
+
+      <div class="broken-item">
+        <div class="broken-title" data-lang="en" class="visible">kernel.js — _pipeRead8/Write8 are empty stubs</div>
+        <div class="broken-title" data-lang="es">kernel.js — _pipeRead8/Write8 son stubs vacíos</div>
+        <div class="broken-body" data-lang="en" class="visible">
+          These three methods are the entire kernel R/W primitive. The pipe trick requires knowing the <code>pipe_buffer.buffer</code> field offset in the FW 11.00 kernel struct. Without the decrypted kernel binary, any value here is invented. The rest of <code>KernelExploit</code> is logically correct but unreachable without these.
+        </div>
+        <div class="broken-body" data-lang="es">
+          Estos tres métodos son toda la primitiva R/W del kernel. El truco del pipe requiere conocer el offset del campo <code>pipe_buffer.buffer</code> en la struct del kernel de FW 11.00. Sin el binario del kernel desencriptado, cualquier valor aquí es inventado. El resto de <code>KernelExploit</code> es lógicamente correcto pero inalcanzable sin esto.
+        </div>
+      </div>
+
+      <div class="broken-item">
+        <div class="broken-title" data-lang="en" class="visible">kernel.js — _ropMmap() returns Int64(0)</div>
+        <div class="broken-title" data-lang="es">kernel.js — _ropMmap() devuelve Int64(0)</div>
+        <div class="broken-body" data-lang="en" class="visible">
+          <code>SYS_MMAP=197</code>, <code>PROT_RW=3</code>, <code>MAP_ANON|PRIVATE=0x1002</code> are stable across firmware. The blocker is capturing <code>rax</code> after the syscall — requires a <code>mov [mem], rax; ret</code> gadget whose offset in <code>libkernel_web.sprx</code> is unknown without the binary.
+        </div>
+        <div class="broken-body" data-lang="es">
+          <code>SYS_MMAP=197</code>, <code>PROT_RW=3</code>, <code>MAP_ANON|PRIVATE=0x1002</code> son estables entre firmwares. El bloqueo es capturar <code>rax</code> tras el syscall — requiere un gadget <code>mov [mem], rax; ret</code> cuyo offset en <code>libkernel_web.sprx</code> es desconocido sin el binario.
+        </div>
+      </div>
+
+      <div class="broken-item">
+        <div class="broken-title" data-lang="en" class="visible">loader.js — missing gadget offsets cause silent 0x0 fallback</div>
+        <div class="broken-title" data-lang="es">loader.js — offsets de gadgets ausentes causan fallback silencioso a 0x0</div>
+        <div class="broken-body" data-lang="en" class="visible">
+          <code>OFFSETS.GADGET_MOV_MEM_RAX</code> and <code>GADGET_MOV_RDI_MEM</code> are not in <code>offsets_1100.js</code>. The <code>|| 0</code> fallback means the ROP chain uses <code>libkernelBase + 0x0</code> as a gadget address — the binary header, not a gadget — and execution immediately corrupts. These are real gadgets that exist in any large enough x86-64 binary; the offset just needs to be found with ROPgadget.
+        </div>
+        <div class="broken-body" data-lang="es">
+          <code>OFFSETS.GADGET_MOV_MEM_RAX</code> y <code>GADGET_MOV_RDI_MEM</code> no están en <code>offsets_1100.js</code>. El fallback <code>|| 0</code> hace que la cadena ROP use <code>libkernelBase + 0x0</code> como dirección de gadget — la cabecera del binario, no un gadget — y la ejecución se corrompe inmediatamente. Son gadgets reales que existen en cualquier binario x86-64 suficientemente grande; el offset solo necesita encontrarse con ROPgadget.
+        </div>
+      </div>
+
+      <div class="broken-item warn-item">
+        <div class="broken-title" data-lang="en" class="visible">pt.c — spin-wait in a borrowed thread is dangerous</div>
+        <div class="broken-title" data-lang="es">pt.c — spin-wait en un hilo prestado es peligroso</div>
+        <div class="broken-body" data-lang="en" class="visible">
+          The injected shellcode runs in a borrowed thread from <code>SceRedisServer</code>. A busy-wait loop at 100% CPU can trigger Orbis OS's watchdog and kill the process. The correct fix is <code>nanosleep()</code> or <code>sched_yield()</code> from libkernel — both of which also have unknown offsets.
+        </div>
+        <div class="broken-body" data-lang="es">
+          El shellcode inyectado corre en un hilo prestado de <code>SceRedisServer</code>. Un bucle de espera activa al 100% de CPU puede activar el watchdog de Orbis OS y matar el proceso. La corrección correcta es <code>nanosleep()</code> o <code>sched_yield()</code> de libkernel — ambos también con offsets desconocidos.
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Exploit chain -->
+    <div class="section-title" data-lang="en" class="visible">Exploit chain — when offsets are filled</div>
+    <div class="section-title" data-lang="es">Cadena de explotación — cuando los offsets estén rellenos</div>
+
+    <div class="chain">
+      <div class="chain-step">
+        <div class="chain-num">01</div>
+        <div class="chain-label">
+          <span data-lang="en" class="visible">triggerWebKitBug() → leakobj / fakeobj</span>
+          <span data-lang="es">triggerWebKitBug() → leakobj / fakeobj</span>
+          <span data-lang="en" class="visible">JSC type confusion, CVE-2021-30889 class, interpreter-only (no JIT)</span>
+          <span data-lang="es">Type confusion JSC, clase CVE-2021-30889, solo intérprete (sin JIT)</span>
+        </div>
+        <div class="chain-arrow">→</div>
+      </div>
+      <div class="chain-step">
+        <div class="chain-num">02</div>
+        <div class="chain-label">
+          <span data-lang="en" class="visible">ArrayBuffer corruption → read8 / write8</span>
+          <span data-lang="es">Corrupción de ArrayBuffer → read8 / write8</span>
+          <span data-lang="en" class="visible">Victim ArrayBuffer backing store pointer overwrite. No SharedArrayBuffer needed.</span>
+          <span data-lang="es">Sobreescritura del puntero backing store del ArrayBuffer víctima. Sin SharedArrayBuffer.</span>
+        </div>
+        <div class="chain-arrow">→</div>
+      </div>
+      <div class="chain-step">
+        <div class="chain-num">03</div>
+        <div class="chain-label">
+          <span data-lang="en" class="visible">libkernel base leak → ROP chain → Worker stack pivot</span>
+          <span data-lang="es">Leak de base libkernel → cadena ROP → pivote de stack en Worker</span>
+          <span data-lang="en" class="visible">Read GOT pointer, compute base, build gadget chain, pivot via Web Worker return address</span>
+          <span data-lang="es">Leer puntero GOT, calcular base, construir cadena de gadgets, pivote vía dirección de retorno del Web Worker</span>
+        </div>
+        <div class="chain-arrow">→</div>
+      </div>
+      <div class="chain-step">
+        <div class="chain-num">04</div>
+        <div class="chain-label">
+          <span data-lang="en" class="visible">umtx UAF → pipe trick → kernel R/W → root + jail escape</span>
+          <span data-lang="es">UAF umtx → truco del pipe → R/W de kernel → root + escape de jail</span>
+          <span data-lang="en" class="visible">FreeBSD umtx race, pipe_buffer corruption, cr_uid=0, cr_prison=prison0</span>
+          <span data-lang="es">Race condition umtx de FreeBSD, corrupción pipe_buffer, cr_uid=0, cr_prison=prison0</span>
+        </div>
+        <div class="chain-arrow">→</div>
+      </div>
+      <div class="chain-step">
+        <div class="chain-num">05</div>
+        <div class="chain-label">
+          <span data-lang="en" class="visible">ptrace → SceRedisServer → persistent TCP :9021</span>
+          <span data-lang="es">ptrace → SceRedisServer → TCP persistente :9021</span>
+          <span data-lang="en" class="visible">Inject elfldr_main() into background process, survives rest mode and browser restarts</span>
+          <span data-lang="es">Inyectar elfldr_main() en proceso en segundo plano, sobrevive modo reposo y reinicios del navegador</span>
+        </div>
+        <div class="chain-arrow">→</div>
+      </div>
+      <div class="chain-step">
+        <div class="chain-num">06</div>
+        <div class="chain-label">
+          <span data-lang="en" class="visible">send_payload.py → ELF/SELF/RAW execution</span>
+          <span data-lang="es">send_payload.py → ejecución ELF/SELF/RAW</span>
+          <span data-lang="en" class="visible">Host PC sends payload over TCP, loader parses and executes in forked child</span>
+          <span data-lang="es">PC host envía payload por TCP, el cargador parsea y ejecuta en proceso hijo fork</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Code example -->
+    <div class="section-title" data-lang="en" class="visible">What the key stub looks like</div>
+    <div class="section-title" data-lang="es">Cómo es el stub clave</div>
+
+    <div class="code-block">
+<span class="cm">// primitives.js — the only function that matters</span>
+<span class="cm">// Without this, nothing else in the chain runs</span>
+
+<span class="kw">function</span> triggerWebKitBug() {
+  <span class="cm">// ┌──────────────────────────────────────────────────────┐</span>
+  <span class="cm">// │  TODO: JSC type confusion trigger for FW 11.00      │</span>
+  <span class="cm">// │                                                      │</span>
+  <span class="cm">// │  1. Find vulnerable JSC code path in Ghidra         │</span>
+  <span class="cm">// │  2. Craft JS that reaches it and confuses the type  │</span>
+  <span class="cm">// │  3. Extract leakobj / fakeobj from confused state   │</span>
+  <span class="cm">// │                                                      │</span>
+  <span class="cm">// │  NOT: JIT-related  (no JIT on PS5)                  │</span>
+  <span class="cm">// │  NOT: SharedArrayBuffer  (disabled on PS5)          │</span>
+  <span class="cm">// │  NOT: V8 internals  (PS5 uses JSC, not V8)          │</span>
+  <span class="cm">// └──────────────────────────────────────────────────────┘</span>
+  <span class="kw">throw new</span> Error(<span class="st">'[TODO] requires FW 11.00 binary analysis'</span>);
+}
+    </div>
+
+  </div><!-- /panel-tech -->
+
+  <!-- Footer -->
+  <div class="footer-note">
+    <div data-lang="en" class="visible">
+      PS5-Toolkit · GPLv3 · Research use only<br>
+      Source: <a href="https://github.com/RastaFairy/PS5-Toolkit-11.00">github.com/RastaFairy/PS5-Toolkit-11.00</a> ·
+      Full limitations: <a href="HONEST_LIMITATIONS.md">HONEST_LIMITATIONS.md</a>
+    </div>
+    <div data-lang="es">
+      PS5-Toolkit · GPLv3 · Solo para uso de investigación<br>
+      Fuente: <a href="https://github.com/RastaFairy/PS5-Toolkit-11.00">github.com/RastaFairy/PS5-Toolkit-11.00</a> ·
+      Limitaciones completas: <a href="HONEST_LIMITATIONS.md">HONEST_LIMITATIONS.md</a>
+    </div>
+  </div>
+
+</div><!-- /wrap -->
+
+<script>
+  let currentLang = 'en';
+  let currentMode = 'plain';
+
+  function setLang(lang) {
+    currentLang = lang;
+
+    // Toggle lang-btn active state
+    document.querySelectorAll('.lang-btn').forEach(b => {
+      b.classList.toggle('active', b.textContent.trim().toLowerCase() === lang);
+    });
+
+    // Show/hide [data-lang] block elements
+    document.querySelectorAll('[data-lang]').forEach(el => {
+      if (el.tagName.toLowerCase() === 'data-lang-inline') return;
+      el.classList.toggle('visible', el.getAttribute('data-lang') === lang);
+    });
+
+    // Show/hide inline <data-lang-inline> elements
+    document.querySelectorAll('data-lang-inline[data-lang]').forEach(el => {
+      el.classList.toggle('visible', el.getAttribute('data-lang') === lang);
+    });
+  }
+
+  function setMode(mode) {
+    currentMode = mode;
+
+    document.querySelectorAll('.mode-tab').forEach((b, i) => {
+      b.classList.toggle('active', (i === 0 && mode === 'plain') || (i === 1 && mode === 'tech'));
+    });
+
+    document.getElementById('panel-plain').classList.toggle('active', mode === 'plain');
+    document.getElementById('panel-tech').classList.toggle('active',  mode === 'tech');
+  }
+
+  // Init
+  setLang('en');
+</script>
+</body>
+</html>
